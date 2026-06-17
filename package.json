@@ -1,0 +1,68 @@
+{
+  "name": "character-graph-app",
+  "version": "0.1.9",
+  "description": "Local character relationship graph workspace for novel authors.",
+  "author": "Local Author",
+  "main": "out/main/index.js",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "tsc --noEmit && electron-vite build",
+    "clean:release": "node scripts/clean-release.mjs",
+    "smoke:electron": "npm run build && node scripts/smoke-electron.mjs",
+    "smoke:packaged": "node scripts/smoke-packaged.mjs",
+    "dist:win": "npm run clean:release && npm run build && electron-builder --win nsis --publish never"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.1.2",
+    "chardet": "^2.1.1",
+    "cytoscape": "^3.33.1",
+    "electron-store": "^11.0.2",
+    "framer-motion": "^12.23.26",
+    "iconv-lite": "^0.7.0",
+    "lucide-react": "^0.561.0",
+    "openai": "^6.10.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3",
+    "sql.js": "^1.13.0"
+  },
+  "devDependencies": {
+    "@types/cytoscape": "^3.21.9",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@types/sql.js": "^1.4.10",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^4.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.7"
+  },
+  "build": {
+    "appId": "com.local.charactergraph",
+    "productName": "人物谱系图",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "out/**",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "node_modules/sql.js/dist/sql-wasm.wasm",
+        "to": "sql-wasm.wasm"
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://example.invalid/character-graph-app/"
+      }
+    ]
+  }
+}
