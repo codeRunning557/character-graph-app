@@ -39,6 +39,7 @@ const emptyGraph: GraphData = {
   characters: [],
   relationships: [],
   events: [],
+  statusEvents: [],
   candidates: []
 };
 
@@ -800,18 +801,27 @@ function splitTags(value: string): string[] {
 }
 
 function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): GraphData {
-  if (!limit) return graph;
-
   const chapterOrder = new Map(graph.chapters.map((chapter) => [chapter.id, chapter.orderIndex]));
+  const limitOrderIndex = limit?.orderIndex ?? Number.POSITIVE_INFINITY;
   const allowedChapterIds = new Set(
     graph.chapters
-      .filter((chapter) => chapter.orderIndex <= limit.orderIndex)
+      .filter((chapter) => chapter.orderIndex <= limitOrderIndex)
       .map((chapter) => chapter.id)
+  );
+  const inactiveCharacterIds = new Set(
+    graph.statusEvents
+      .filter((event) => event.status === 'dead' || event.status === 'retired' || event.status === 'unused')
+      .filter((event) => {
+        if (event.chapterId === null) return true;
+        const orderIndex = chapterOrder.get(event.chapterId);
+        return orderIndex !== undefined && orderIndex <= limitOrderIndex;
+      })
+      .map((event) => event.characterId)
   );
   const events = graph.events.filter((event) => {
     if (event.chapterId === null) return true;
     const orderIndex = chapterOrder.get(event.chapterId);
-    return orderIndex !== undefined && orderIndex <= limit.orderIndex;
+    return orderIndex !== undefined && orderIndex <= limitOrderIndex;
   });
   const relationshipIds = new Set(events.map((event) => event.relationshipId));
   const eventsByRelationship = new Map<number, BondEvent[]>();
@@ -821,7 +831,11 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
     eventsByRelationship.set(event.relationshipId, current);
   });
   const relationships = graph.relationships
-    .filter((relationship) => relationshipIds.has(relationship.id))
+    .filter((relationship) =>
+      relationshipIds.has(relationship.id) &&
+      !inactiveCharacterIds.has(relationship.sourceCharacterId) &&
+      !inactiveCharacterIds.has(relationship.targetCharacterId)
+    )
     .map((relationship) => {
       const scopedSummary = [...new Set((eventsByRelationship.get(relationship.id) ?? [])
         .map((event) => event.summary.trim())
@@ -829,6 +843,8 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
         .join('\n');
       return scopedSummary ? { ...relationship, summary: scopedSummary } : relationship;
     });
+  const visibleRelationshipIds = new Set(relationships.map((relationship) => relationship.id));
+  const visibleEvents = events.filter((event) => visibleRelationshipIds.has(event.relationshipId));
   const characterIds = new Set<number>();
 
   relationships.forEach((relationship) => {
@@ -836,7 +852,10 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
     characterIds.add(relationship.targetCharacterId);
   });
   graph.characters.forEach((character) => {
-    if (character.firstChapterId === null || allowedChapterIds.has(character.firstChapterId)) {
+    if (
+      !inactiveCharacterIds.has(character.id) &&
+      (character.firstChapterId === null || allowedChapterIds.has(character.firstChapterId))
+    ) {
       characterIds.add(character.id);
     }
   });
@@ -845,7 +864,8 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
     chapters: graph.chapters,
     characters: graph.characters.filter((character) => characterIds.has(character.id)),
     relationships,
-    events,
+    events: visibleEvents,
+    statusEvents: graph.statusEvents,
     candidates: graph.candidates
   };
 }

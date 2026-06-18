@@ -80,6 +80,16 @@ export interface BondEvent {
   status: 'candidate' | 'confirmed' | 'rejected';
 }
 
+export interface CharacterStatusEvent {
+  id: number;
+  characterId: number;
+  characterName: string;
+  chapterId: number | null;
+  chapterTitle: string | null;
+  status: 'active' | 'dead' | 'retired' | 'unused';
+  evidence: string;
+}
+
 export interface CandidateExtraction {
   id: number;
   chapterId: number | null;
@@ -96,6 +106,7 @@ export interface GraphData {
   characters: CharacterNode[];
   relationships: RelationshipEdge[];
   events: BondEvent[];
+  statusEvents: CharacterStatusEvent[];
   candidates: CandidateExtraction[];
 }
 
@@ -131,6 +142,11 @@ export interface ExtractionRelationship {
 export interface ExtractionResult {
   characters: ExtractionCharacter[];
   relationships: ExtractionRelationship[];
+  statusEvents?: Array<{
+    character: string;
+    status: 'active' | 'dead' | 'retired' | 'unused' | string;
+    evidence?: string;
+  }>;
 }
 
 export interface AppApi {

@@ -12,6 +12,7 @@ import type {
   CandidateExtraction,
   Chapter,
   CharacterNode,
+  CharacterStatusEvent,
   ExtractionResult,
   GraphData,
   LlmConfig,
@@ -280,6 +281,14 @@ function createSchema(db: Database): void {
       order_index INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'confirmed'
     );
+    CREATE TABLE IF NOT EXISTS character_status_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      character_id INTEGER NOT NULL,
+      chapter_id INTEGER,
+      status TEXT NOT NULL,
+      evidence TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS candidate_extractions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chapter_id INTEGER,
@@ -457,6 +466,24 @@ async function graphData(projectPath: string): Promise<GraphData> {
       status: String(row.status) as BondEvent['status']
     })
   );
+  const statusEvents = query<CharacterStatusEvent>(
+    db,
+    `SELECT se.*, ch.name AS character_name, c.title AS chapter_title
+     FROM character_status_events se
+     JOIN characters ch ON ch.id = se.character_id
+     LEFT JOIN chapters c ON c.id = se.chapter_id
+     ORDER BY c.order_index ASC, se.id ASC`,
+    [],
+    (row) => ({
+      id: Number(row.id),
+      characterId: Number(row.character_id),
+      characterName: String(row.character_name),
+      chapterId: row.chapter_id === null ? null : Number(row.chapter_id),
+      chapterTitle: row.chapter_title === null ? null : String(row.chapter_title),
+      status: String(row.status) as CharacterStatusEvent['status'],
+      evidence: String(row.evidence ?? '')
+    })
+  );
   const candidates = query<CandidateExtraction>(
     db,
     `SELECT ce.*, c.title AS chapter_title
@@ -476,7 +503,7 @@ async function graphData(projectPath: string): Promise<GraphData> {
     })
   );
   await saveDb(projectPath, db);
-  return { chapters, characters, relationships, events, candidates };
+  return { chapters, characters, relationships, events, statusEvents, candidates };
 }
 
 function normalizeEncodingName(name: string | null): string {
@@ -540,11 +567,15 @@ async function importNovelFile(projectPath: string, filePath: string): Promise<G
 
 function extractionPrompt(chapter: Chapter): string {
   return `你是小说人物关系抽取器。只根据给定章节文本抽取，不要补充常识，不要编造。
+statusEvents 只在原文明确说明人物死亡、退场、封存、离开主线、后续不再使用时输出；不要因为人物本章未出现就判断 unused。
 
 输出严格 JSON，结构如下：
 {
   "characters": [
     {"name": "人物名", "aliases": ["别名"], "summary": "本章中可证实的人物信息", "tags": ["身份或阵营"], "evidence": "原文证据片段"}
+  ],
+  "statusEvents": [
+    {"character": "人物名", "status": "active/dead/retired/unused", "evidence": "原文明确证据片段"}
   ],
   "relationships": [
     {
@@ -575,7 +606,8 @@ function parseExtraction(raw: string): ExtractionResult {
   const parsed = JSON.parse(candidate.slice(first, last + 1)) as Partial<ExtractionResult>;
   return {
     characters: Array.isArray(parsed.characters) ? parsed.characters : [],
-    relationships: Array.isArray(parsed.relationships) ? parsed.relationships : []
+    relationships: Array.isArray(parsed.relationships) ? parsed.relationships : [],
+    statusEvents: Array.isArray(parsed.statusEvents) ? parsed.statusEvents : []
   };
 }
 
@@ -706,9 +738,57 @@ function upsertRelationship(
   return Number(scalar<number>(db, 'SELECT last_insert_rowid()'));
 }
 
+function normalizeCharacterStatus(value: string): CharacterStatusEvent['status'] | null {
+  const text = value.toLowerCase();
+  if (/死亡|已死|身亡|战死|陨落|dead|died|killed/.test(text)) return 'dead';
+  if (/退场|离队|离开主线|退出|retired|left/.test(text)) return 'retired';
+  if (/不再使用|不再登场|后续不再|弃用|unused|inactive/.test(text)) return 'unused';
+  if (/活跃|登场|active/.test(text)) return 'active';
+  return null;
+}
+
+function upsertCharacterStatusEvent(
+  db: Database,
+  characterId: number,
+  chapterId: number | null,
+  status: CharacterStatusEvent['status'],
+  evidence: string
+): void {
+  if (status === 'active') return;
+  const existing = scalar<number>(
+    db,
+    `SELECT id FROM character_status_events
+     WHERE character_id = ?
+       AND ((chapter_id IS NULL AND ? IS NULL) OR chapter_id = ?)
+       AND status = ?
+     LIMIT 1`,
+    [characterId, chapterId, chapterId, status]
+  );
+  if (existing) return;
+  db.run(
+    `INSERT INTO character_status_events (character_id, chapter_id, status, evidence)
+     VALUES (?, ?, ?, ?)`,
+    [characterId, chapterId, status, evidence]
+  );
+}
+
 function applyExtraction(db: Database, chapterId: number | null, result: ExtractionResult): void {
   for (const character of result.characters) {
-    if (character.name) upsertCharacter(db, character, chapterId);
+    if (!character.name) continue;
+    const characterId = upsertCharacter(db, character, chapterId);
+    const inferredStatus = normalizeCharacterStatus(
+      [...(character.tags ?? []), character.summary ?? ''].join(' ')
+    );
+    if (inferredStatus) {
+      upsertCharacterStatusEvent(db, characterId, chapterId, inferredStatus, character.evidence ?? character.summary ?? '');
+    }
+  }
+  for (const event of result.statusEvents ?? []) {
+    if (!event.character) continue;
+    const status = normalizeCharacterStatus(event.status);
+    if (!status) continue;
+    const characterId = upsertCharacter(db, { name: event.character, tags: [status] }, chapterId);
+    upsertCharacterStatusEvent(db, characterId, chapterId, status, event.evidence ?? '');
   }
   for (const relationship of result.relationships) {
     if (!relationship.source || !relationship.target) continue;

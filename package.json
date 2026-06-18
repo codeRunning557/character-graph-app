@@ -1,6 +1,6 @@
 {
   "name": "character-graph-app",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "description": "Local character relationship graph workspace for novel authors.",
   "author": "Local Author",
   "main": "out/main/index.js",
