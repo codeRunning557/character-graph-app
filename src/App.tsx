@@ -56,6 +56,7 @@ const defaultConfig: LlmConfig = {
 export function App(): ReactElement {
   const [project, setProject] = useState<ProjectSummary | null>(null);
   const [graph, setGraph] = useState<GraphData>(emptyGraph);
+  const [chapterLimitId, setChapterLimitId] = useState<number | null>(null);
   const [selection, setSelection] = useState<Selection>(null);
   const [status, setStatus] = useState('未打开项目');
   const [busy, setBusy] = useState(false);
@@ -154,18 +155,26 @@ export function App(): ReactElement {
     };
   }, []);
 
+  const chapterLimit = useMemo(
+    () => graph.chapters.find((chapter) => chapter.id === chapterLimitId) ?? null,
+    [chapterLimitId, graph.chapters]
+  );
+  const scopedGraph = useMemo(
+    () => buildChapterScopedGraph(graph, chapterLimit),
+    [chapterLimit, graph]
+  );
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
     const degree = new Map<number, number>();
-    graph.relationships.forEach((relationship) => {
+    scopedGraph.relationships.forEach((relationship) => {
       degree.set(relationship.sourceCharacterId, (degree.get(relationship.sourceCharacterId) ?? 0) + 1);
       degree.set(relationship.targetCharacterId, (degree.get(relationship.targetCharacterId) ?? 0) + 1);
     });
-    const linearPositions = buildLinearPositions(graph.characters, graph.relationships);
+    const linearPositions = buildLinearPositions(scopedGraph.characters, scopedGraph.relationships);
     cy.elements().remove();
     cy.add([
-      ...graph.characters.map((character) => ({
+      ...scopedGraph.characters.map((character) => ({
         group: 'nodes' as const,
         position: linearPositions.get(character.id) ?? { x: 0, y: 0 },
         data: {
@@ -174,7 +183,7 @@ export function App(): ReactElement {
           degree: degree.get(character.id) ?? 0
         }
       })),
-      ...graph.relationships.map((relationship) => ({
+      ...scopedGraph.relationships.map((relationship) => ({
         group: 'edges' as const,
         data: {
           id: `r-${relationship.id}`,
@@ -191,7 +200,7 @@ export function App(): ReactElement {
       fit: true,
       padding: 90
     }).run();
-  }, [graph.characters, graph.relationships]);
+  }, [scopedGraph.characters, scopedGraph.relationships]);
 
   const selectedChapter = useMemo(
     () =>
@@ -203,16 +212,16 @@ export function App(): ReactElement {
   const selectedCharacter = useMemo(
     () =>
       selection?.type === 'character'
-        ? graph.characters.find((character) => character.id === selection.id) ?? null
+        ? scopedGraph.characters.find((character) => character.id === selection.id) ?? null
         : null,
-    [graph.characters, selection]
+    [scopedGraph.characters, selection]
   );
   const selectedRelationship = useMemo(
     () =>
       selection?.type === 'relationship'
-        ? graph.relationships.find((relationship) => relationship.id === selection.id) ?? null
+        ? scopedGraph.relationships.find((relationship) => relationship.id === selection.id) ?? null
         : null,
-    [graph.relationships, selection]
+    [scopedGraph.relationships, selection]
   );
   const selectedCandidate = useMemo(
     () =>
@@ -224,9 +233,9 @@ export function App(): ReactElement {
   const relationshipEvents = useMemo(
     () =>
       selectedRelationship
-        ? graph.events.filter((event) => event.relationshipId === selectedRelationship.id)
+        ? scopedGraph.events.filter((event) => event.relationshipId === selectedRelationship.id)
         : [],
-    [graph.events, selectedRelationship]
+    [scopedGraph.events, selectedRelationship]
   );
   const pendingCandidates = graph.candidates.filter((candidate) => candidate.status === 'pending');
 
@@ -256,6 +265,7 @@ export function App(): ReactElement {
     ]);
     setGraph(data);
     setConfig(nextConfig);
+    setChapterLimitId(null);
   }
 
   async function openProject(): Promise<void> {
@@ -268,12 +278,16 @@ export function App(): ReactElement {
     ]);
     setGraph(data);
     setConfig(nextConfig);
+    setChapterLimitId(null);
   }
 
   async function importNovel(): Promise<void> {
     if (!project) return;
     const data = await runTask('正在导入并分章', () => window.characterGraph.importNovel(project.path));
-    if (data) setGraph(data);
+    if (data) {
+      setGraph(data);
+      setChapterLimitId(null);
+    }
   }
 
   async function analyzeNovel(): Promise<void> {
@@ -302,7 +316,10 @@ export function App(): ReactElement {
     const data = await runTask('正在调用模型分析章节', () =>
       window.characterGraph.analyzeChapter(project.path, chapterId)
     );
-    if (data) setGraph(data);
+    if (data) {
+      setGraph(data);
+      setChapterLimitId(chapterId);
+    }
   }
 
   async function confirmCandidate(candidateId: number): Promise<void> {
@@ -351,6 +368,18 @@ export function App(): ReactElement {
     }));
   }
 
+  function selectChapterScope(chapter: Chapter): void {
+    setSelection({ type: 'chapter', id: chapter.id });
+    setChapterLimitId(chapter.id);
+    setStatus(`图谱范围已切换为第 1-${chapter.orderIndex} 章`);
+  }
+
+  function showFullGraph(): void {
+    setSelection(null);
+    setChapterLimitId(null);
+    setStatus('图谱范围已切换为全书');
+  }
+
   return (
     <div className="app-shell">
       <aside className="left-rail">
@@ -389,11 +418,14 @@ export function App(): ReactElement {
             <small>{graph.chapters.length}</small>
           </div>
           <div className="scroll-list">
+            <button className={!chapterLimitId ? 'list-item active' : 'list-item'} onClick={showFullGraph}>
+              <span>全书</span>
+            </button>
             {graph.chapters.map((chapter) => (
               <button
-                className={selection?.type === 'chapter' && selection.id === chapter.id ? 'list-item active' : 'list-item'}
+                className={chapterLimitId === chapter.id ? 'list-item active' : 'list-item'}
                 key={chapter.id}
-                onClick={() => setSelection({ type: 'chapter', id: chapter.id })}
+                onClick={() => selectChapterScope(chapter)}
               >
                 <span>{chapter.title}</span>
                 <Play size={14} onClick={(event) => {
@@ -431,7 +463,10 @@ export function App(): ReactElement {
         <header className="topbar">
           <div>
             <span className="path-label">{project?.path ?? '请选择或创建一个项目'}</span>
-            <strong>{graph.characters.length} 人物 / {graph.relationships.length} 关系 / {graph.events.length} 事件</strong>
+            <strong>{scopedGraph.characters.length} 人物 / {scopedGraph.relationships.length} 关系 / {scopedGraph.events.length} 事件</strong>
+            <span className="scope-label">
+              {chapterLimit ? `当前图谱：第 1-${chapterLimit.orderIndex} 章` : '当前图谱：全书'}
+            </span>
           </div>
           <div className="top-actions">
             <button disabled={busy} onClick={() => setShowSettings(true)}>
@@ -447,7 +482,7 @@ export function App(): ReactElement {
 
         <div className="graph-stage">
           <div className="graph-canvas" ref={graphHost} />
-          {!graph.characters.length && (
+          {!scopedGraph.characters.length && (
             <motion.div
               className="empty-state"
               initial={{ opacity: 0, y: 8 }}
@@ -759,6 +794,57 @@ function splitTags(value: string): string[] {
     .split(/[，,]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): GraphData {
+  if (!limit) return graph;
+
+  const chapterOrder = new Map(graph.chapters.map((chapter) => [chapter.id, chapter.orderIndex]));
+  const allowedChapterIds = new Set(
+    graph.chapters
+      .filter((chapter) => chapter.orderIndex <= limit.orderIndex)
+      .map((chapter) => chapter.id)
+  );
+  const events = graph.events.filter((event) => {
+    if (event.chapterId === null) return true;
+    const orderIndex = chapterOrder.get(event.chapterId);
+    return orderIndex !== undefined && orderIndex <= limit.orderIndex;
+  });
+  const relationshipIds = new Set(events.map((event) => event.relationshipId));
+  const eventsByRelationship = new Map<number, BondEvent[]>();
+  events.forEach((event) => {
+    const current = eventsByRelationship.get(event.relationshipId) ?? [];
+    current.push(event);
+    eventsByRelationship.set(event.relationshipId, current);
+  });
+  const relationships = graph.relationships
+    .filter((relationship) => relationshipIds.has(relationship.id))
+    .map((relationship) => {
+      const scopedSummary = [...new Set((eventsByRelationship.get(relationship.id) ?? [])
+        .map((event) => event.summary.trim())
+        .filter(Boolean))]
+        .join('\n');
+      return scopedSummary ? { ...relationship, summary: scopedSummary } : relationship;
+    });
+  const characterIds = new Set<number>();
+
+  relationships.forEach((relationship) => {
+    characterIds.add(relationship.sourceCharacterId);
+    characterIds.add(relationship.targetCharacterId);
+  });
+  graph.characters.forEach((character) => {
+    if (character.firstChapterId === null || allowedChapterIds.has(character.firstChapterId)) {
+      characterIds.add(character.id);
+    }
+  });
+
+  return {
+    chapters: graph.chapters,
+    characters: graph.characters.filter((character) => characterIds.has(character.id)),
+    relationships,
+    events,
+    candidates: graph.candidates
+  };
 }
 
 function buildLinearPositions(

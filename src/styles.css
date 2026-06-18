@@ -278,6 +278,11 @@ label {
   font-size: 15px;
 }
 
+.scope-label {
+  color: #786859;
+  font-size: 12px;
+}
+
 .top-actions,
 .button-row,
 .modal-actions {
