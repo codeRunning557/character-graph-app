@@ -293,11 +293,14 @@ export function App(): ReactElement {
   async function analyzeNovel(): Promise<void> {
     if (!project) return;
     const startedAt = performance.now();
-    const result = await runTask('正在生成谱系图：本次最多分析 3 个未处理章节', () =>
-      window.characterGraph.analyzeNovel(project.path)
+    const targetChapter = chapterLimit;
+    const targetText = targetChapter ? `第 1-${targetChapter.orderIndex} 章` : '全书';
+    const result = await runTask(`正在生成谱系图：范围 ${targetText}，本次最多分析 3 个未入图章节`, () =>
+      window.characterGraph.analyzeNovel(project.path, targetChapter?.id ?? null)
     );
     if (result) {
       setGraph(result.graph);
+      if (targetChapter) setChapterLimitId(targetChapter.id);
       const elapsedSeconds = (performance.now() - startedAt) / 1000;
       const elapsedText =
         elapsedSeconds < 60
@@ -305,8 +308,8 @@ export function App(): ReactElement {
           : `${(elapsedSeconds / 60).toFixed(2)} 分钟`;
       setStatus(
         result.errors.length
-          ? `本批处理 ${result.processed} 章，剩余 ${result.remaining} 章，耗时 ${elapsedText}；错误：${result.errors[0]}`
-          : `本批处理 ${result.processed} 章，剩余 ${result.remaining} 章，耗时 ${elapsedText}。继续点击可处理下一批。`
+          ? `范围 ${targetText}：本批处理 ${result.processed} 章，剩余 ${result.remaining} 章，耗时 ${elapsedText}；错误：${result.errors[0]}`
+          : `范围 ${targetText}：本批处理 ${result.processed} 章，剩余 ${result.remaining} 章，耗时 ${elapsedText}。继续点击可处理下一批。`
       );
     }
   }

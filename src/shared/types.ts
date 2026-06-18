@@ -143,7 +143,7 @@ export interface AppApi {
   loadLlmConfig(projectPath: string | null): Promise<LlmConfig>;
   testLlm(config: LlmConfig): Promise<{ ok: boolean; message: string }>;
   analyzeChapter(projectPath: string, chapterId: number): Promise<GraphData>;
-  analyzeNovel(projectPath: string): Promise<AnalyzeNovelResult>;
+  analyzeNovel(projectPath: string, upToChapterId?: number | null): Promise<AnalyzeNovelResult>;
   confirmCandidate(projectPath: string, candidateId: number): Promise<GraphData>;
   rejectCandidate(projectPath: string, candidateId: number): Promise<GraphData>;
   updateCharacter(projectPath: string, character: CharacterNode): Promise<GraphData>;

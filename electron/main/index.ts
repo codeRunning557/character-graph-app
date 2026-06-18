@@ -851,22 +851,34 @@ ipcMain.handle('llm:analyze-chapter', async (_event, projectPath: string, chapte
   return graphData(projectPath);
 });
 
-ipcMain.handle('llm:analyze-novel', async (_event, projectPath: string) => {
+ipcMain.handle('llm:analyze-novel', async (_event, projectPath: string, upToChapterId?: number | null) => {
   const config = await readLlmConfig(projectPath);
   if (config.provider !== 'ollama' && !config.apiKey.trim()) {
     throw new Error('请先点击“模型”，填写 DeepSeek API Key，保存后再生成谱系图。');
   }
   const db = await openDb(projectPath);
+  const limitOrder = upToChapterId
+    ? scalar<number>(db, 'SELECT order_index FROM chapters WHERE id = ?', [upToChapterId])
+    : null;
+  if (upToChapterId && limitOrder === null) {
+    await saveDb(projectPath, db);
+    throw new Error('章节不存在。');
+  }
   const chapters = query<Chapter>(
     db,
     `SELECT c.*
      FROM chapters c
-     WHERE NOT EXISTS (
+     WHERE (? IS NULL OR c.order_index <= ?)
+       AND NOT EXISTS (
        SELECT 1 FROM candidate_extractions ce
-       WHERE ce.chapter_id = c.id AND ce.kind IN ('batch', 'error')
+       WHERE ce.chapter_id = c.id
+         AND (
+           (ce.kind = 'batch' AND ce.status = 'confirmed')
+           OR ce.kind = 'error'
+         )
      )
      ORDER BY c.order_index ASC, c.id ASC`,
-    [],
+    [limitOrder, limitOrder],
     (row) => ({
       id: Number(row.id),
       title: String(row.title),

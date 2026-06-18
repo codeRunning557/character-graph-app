@@ -14,7 +14,8 @@ const api: AppApi = {
   testLlm: (config: LlmConfig) => ipcRenderer.invoke('llm:test', config),
   analyzeChapter: (projectPath: string, chapterId: number) =>
     ipcRenderer.invoke('llm:analyze-chapter', projectPath, chapterId),
-  analyzeNovel: (projectPath: string) => ipcRenderer.invoke('llm:analyze-novel', projectPath),
+  analyzeNovel: (projectPath: string, upToChapterId?: number | null) =>
+    ipcRenderer.invoke('llm:analyze-novel', projectPath, upToChapterId),
   confirmCandidate: (projectPath: string, candidateId: number) =>
     ipcRenderer.invoke('candidate:confirm', projectPath, candidateId),
   rejectCandidate: (projectPath: string, candidateId: number) =>
