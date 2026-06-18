@@ -1,6 +1,6 @@
 {
   "name": "character-graph-app",
-  "version": "0.1.13",
+  "version": "0.1.14",
   "description": "Local character relationship graph workspace for novel authors.",
   "author": "Local Author",
   "main": "out/main/index.js",
@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "tsc --noEmit && electron-vite build",
+    "build:web": "npm run build",
+    "web": "node web/server.mjs",
     "clean:release": "node scripts/clean-release.mjs",
     "smoke:electron": "npm run build && node scripts/smoke-electron.mjs",
     "smoke:packaged": "node scripts/smoke-packaged.mjs",

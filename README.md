@@ -26,6 +26,19 @@ npm run dist:win
 
 构建前会自动清理旧的 `release` 目录。
 
+## 在线 Web 版
+
+```bash
+npm run build:web
+npm run web
+```
+
+默认访问地址是 `http://localhost:4173`。Web 版数据保存到 `web-data/`，可通过 `CHARACTER_GRAPH_WEB_DATA` 指定其他数据目录：
+
+```bash
+CHARACTER_GRAPH_WEB_DATA=/data/character-graph PORT=4173 npm run web
+```
+
 ## 隐私说明
 
-模型 API Key 保存到 Electron 的用户数据目录，不随项目源码提交。仓库已忽略 `model.config.json`、`graph.sqlite`、导入原文、导出文件、构建产物和安装包。
+模型 API Key 保存到 Electron 的用户数据目录或 Web 版后端数据目录，不随项目源码提交。仓库已忽略 `model.config.json`、`graph.sqlite`、`web-data/`、导入原文、导出文件、构建产物和安装包。

@@ -1,7 +1,10 @@
 import React, { type ReactNode } from 'react';
 import ReactDOM from 'react-dom/client';
 import { App } from './App';
+import { installWebApi } from './webApi';
 import './styles.css';
+
+installWebApi();
 
 class RootErrorBoundary extends React.Component<{ children: ReactNode }, { error: Error | null }> {
   constructor(props: { children: ReactNode }) {

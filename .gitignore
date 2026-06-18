@@ -38,6 +38,7 @@ originals/
 exports/
 imported/
 CharacterGraphProjects/
+web-data/
 
 # OS/editor noise
 .DS_Store
