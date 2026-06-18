@@ -21,7 +21,6 @@ import type {
 } from '../../src/shared/types';
 
 const llmRequestTimeoutMs = 60_000;
-const maxChaptersPerRun = 3;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let SQL: SqlJsStatic | null = null;
@@ -890,7 +889,7 @@ ipcMain.handle('llm:analyze-novel', async (_event, projectPath: string, upToChap
   );
   let processed = 0;
   const errors: string[] = [];
-  for (const chapter of chapters.slice(0, maxChaptersPerRun)) {
+  for (const chapter of chapters) {
     try {
       const extraction = await callLlm(config, chapter);
       db.run(
