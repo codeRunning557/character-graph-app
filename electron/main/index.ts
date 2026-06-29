@@ -8,6 +8,7 @@ import iconv from 'iconv-lite';
 import initSqlJs, { type Database, type SqlJsStatic, type SqlValue } from 'sql.js';
 import OpenAI from 'openai';
 import type {
+  AnalysisProgress,
   BondEvent,
   CandidateExtraction,
   Chapter,
@@ -22,9 +23,26 @@ import type {
 } from '../../src/shared/types';
 
 const llmRequestTimeoutMs = 60_000;
+const analysisConcurrency = 3;
+const analysisMaxRetries = 2;
+const analysisChunkSize = 15_000;
+const analysisChunkOverlap = 500;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let SQL: SqlJsStatic | null = null;
+
+interface AnalysisRuntime {
+  state: AnalysisProgress;
+  chapters: Chapter[];
+  config: LlmConfig;
+  nextIndex: number;
+  activeTitles: Set<string>;
+  abortControllers: Set<AbortController>;
+  persistQueue: Promise<void>;
+}
+
+const analysisJobs = new Map<string, AnalysisRuntime>();
+const projectWriteQueues = new Map<string, Promise<void>>();
 
 const presets: LlmPreset[] = [
   {
@@ -214,6 +232,92 @@ function dbPath(projectPath: string): string {
 
 function configPath(projectPath: string): string {
   return path.join(projectPath, 'model.config.json');
+}
+
+function analysisStatePath(projectPath: string): string {
+  return path.join(projectPath, 'analysis.state.json');
+}
+
+function idleAnalysisProgress(): AnalysisProgress {
+  return {
+    status: 'idle',
+    targetChapterId: null,
+    targetOrderIndex: null,
+    total: 0,
+    completed: 0,
+    failed: 0,
+    remaining: 0,
+    activeChapterTitles: [],
+    errors: [],
+    startedAt: null,
+    updatedAt: new Date().toISOString(),
+    elapsedMs: 0,
+    estimatedRemainingMs: null,
+    concurrency: analysisConcurrency
+  };
+}
+
+function analysisSnapshot(runtime: AnalysisRuntime): AnalysisProgress {
+  const state = runtime.state;
+  const isActive = state.status === 'running' || state.status === 'paused';
+  const elapsedMs = isActive && state.startedAt
+    ? Math.max(state.elapsedMs, Date.now() - Date.parse(state.startedAt))
+    : state.elapsedMs;
+  const finished = state.completed + state.failed;
+  const averageMs = finished > 0 ? elapsedMs / finished : 0;
+  return {
+    ...state,
+    elapsedMs,
+    remaining: Math.max(0, state.total - finished),
+    activeChapterTitles: [...runtime.activeTitles],
+    estimatedRemainingMs: averageMs > 0
+      ? Math.round((Math.max(0, state.total - finished) * averageMs) / analysisConcurrency)
+      : null
+  };
+}
+
+async function persistAnalysisProgress(projectPath: string, runtime: AnalysisRuntime): Promise<void> {
+  const snapshot = analysisSnapshot(runtime);
+  runtime.state = snapshot;
+  const payload = JSON.stringify(snapshot, null, 2);
+  runtime.persistQueue = runtime.persistQueue
+    .catch(() => undefined)
+    .then(() => writeFile(analysisStatePath(projectPath), payload, 'utf8'));
+  await runtime.persistQueue;
+}
+
+async function readAnalysisProgress(projectPath: string): Promise<AnalysisProgress> {
+  const runtime = analysisJobs.get(projectPath);
+  if (runtime) return analysisSnapshot(runtime);
+  if (!existsSync(analysisStatePath(projectPath))) return idleAnalysisProgress();
+  const stored = {
+    ...idleAnalysisProgress(),
+    ...(JSON.parse(await readFile(analysisStatePath(projectPath), 'utf8')) as Partial<AnalysisProgress>)
+  };
+  if (stored.status === 'running') stored.status = 'paused';
+  return stored;
+}
+
+async function withProjectDbWrite(
+  projectPath: string,
+  action: (db: Database) => void
+): Promise<void> {
+  const previous = projectWriteQueues.get(projectPath) ?? Promise.resolve();
+  let release = (): void => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.catch(() => undefined).then(() => gate);
+  projectWriteQueues.set(projectPath, queued);
+  await previous.catch(() => undefined);
+  try {
+    const db = await openDb(projectPath);
+    action(db);
+    await saveDb(projectPath, db);
+  } finally {
+    release();
+    if (projectWriteQueues.get(projectPath) === queued) projectWriteQueues.delete(projectPath);
+  }
 }
 
 function globalConfigPath(): string {
@@ -594,7 +698,7 @@ statusEvents 只在原文明确说明人物死亡、退场、封存、离开主�
 章节标题：${chapter.title}
 
 章节正文：
-${chapter.content.slice(0, 18000)}`;
+${chapter.content}`;
 }
 
 function parseExtraction(raw: string): ExtractionResult {
@@ -611,7 +715,7 @@ function parseExtraction(raw: string): ExtractionResult {
   };
 }
 
-async function callLlm(config: LlmConfig, chapter: Chapter): Promise<ExtractionResult> {
+async function callLlm(config: LlmConfig, chapter: Chapter, signal?: AbortSignal): Promise<ExtractionResult> {
   if (config.provider !== 'ollama' && !config.apiKey.trim()) {
     throw new Error('请先在“模型”里填写 API Key，并点击“保存配置”。');
   }
@@ -639,11 +743,322 @@ async function callLlm(config: LlmConfig, chapter: Chapter): Promise<ExtractionR
       { role: 'user', content: extractionPrompt(chapter) }
     ],
     ...extraBody
-  });
+  }, { signal });
   const content = response.choices[0]?.message?.content ?? '';
   return parseExtraction(content);
 }
 
+function splitChapterForAnalysis(chapter: Chapter): Chapter[] {
+  if (chapter.content.length <= analysisChunkSize) return [chapter];
+  const chunks: Chapter[] = [];
+  let start = 0;
+  let part = 1;
+  while (start < chapter.content.length) {
+    let end = Math.min(chapter.content.length, start + analysisChunkSize);
+    if (end < chapter.content.length) {
+      const paragraphBreak = chapter.content.lastIndexOf('\n', end);
+      if (paragraphBreak > start + Math.floor(analysisChunkSize * 0.6)) end = paragraphBreak;
+    }
+    const content = chapter.content.slice(start, end).trim();
+    if (content) {
+      chunks.push({
+        ...chapter,
+        title: chapter.title + '（分段 ' + part + '）',
+        content,
+        contentLength: content.length
+      });
+      part += 1;
+    }
+    if (end >= chapter.content.length) break;
+    start = Math.max(start + 1, end - analysisChunkOverlap);
+  }
+  return chunks;
+}
+
+function mergeExtractions(results: ExtractionResult[]): ExtractionResult {
+  const characters = new Map<string, ExtractionResult['characters'][number]>();
+  const relationships = new Map<string, ExtractionResult['relationships'][number]>();
+  const statusEvents = new Map<string, NonNullable<ExtractionResult['statusEvents']>[number]>();
+
+  for (const result of results) {
+    for (const character of result.characters) {
+      const name = character.name?.trim();
+      if (!name) continue;
+      const existing = characters.get(name);
+      characters.set(name, existing ? {
+        ...existing,
+        aliases: [...new Set([...(existing.aliases ?? []), ...(character.aliases ?? [])])],
+        tags: [...new Set([...(existing.tags ?? []), ...(character.tags ?? [])])],
+        summary: existing.summary || character.summary,
+        evidence: existing.evidence || character.evidence
+      } : character);
+    }
+    for (const relationship of result.relationships) {
+      if (!relationship.source || !relationship.target) continue;
+      const pair = [relationship.source.trim(), relationship.target.trim()].sort().join('|');
+      const key = pair + '|' + (relationship.type || '未知');
+      const existing = relationships.get(key);
+      relationships.set(key, existing ? {
+        ...existing,
+        strength: Math.max(existing.strength ?? 1, relationship.strength ?? 1),
+        confidence: Math.max(existing.confidence ?? 0, relationship.confidence ?? 0),
+        summary: existing.summary || relationship.summary,
+        evidence: existing.evidence || relationship.evidence,
+        events: [...(existing.events ?? []), ...(relationship.events ?? [])]
+      } : relationship);
+    }
+    for (const event of result.statusEvents ?? []) {
+      if (!event.character || !event.status) continue;
+      statusEvents.set(event.character.trim() + '|' + event.status, event);
+    }
+  }
+
+  return {
+    characters: [...characters.values()],
+    relationships: [...relationships.values()],
+    statusEvents: [...statusEvents.values()]
+  };
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('分析已取消'));
+      return;
+    }
+    const timeout = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timeout);
+      reject(new Error('分析已取消'));
+    }, { once: true });
+  });
+}
+
+async function callChapterWithRetry(
+  config: LlmConfig,
+  chapter: Chapter,
+  signal?: AbortSignal
+): Promise<ExtractionResult> {
+  const results: ExtractionResult[] = [];
+  for (const chunk of splitChapterForAnalysis(chapter)) {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt <= analysisMaxRetries; attempt += 1) {
+      try {
+        results.push(await callLlm(config, chunk, signal));
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (signal?.aborted) throw error;
+        if (attempt < analysisMaxRetries) await abortableDelay(1200 * (attempt + 1), signal);
+      }
+    }
+    if (lastError) throw lastError;
+  }
+  return mergeExtractions(results);
+}
+
+async function persistAnalysisCandidate(
+  projectPath: string,
+  chapterId: number,
+  extraction: ExtractionResult
+): Promise<void> {
+  await withProjectDbWrite(projectPath, (db) => {
+    db.run(
+      "UPDATE candidate_extractions SET status = 'rejected' WHERE chapter_id = ? AND kind = 'error' AND status = 'error'",
+      [chapterId]
+    );
+    db.run(
+      "INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status) VALUES (?, 'batch', ?, 'pending')",
+      [chapterId, JSON.stringify(extraction)]
+    );
+  });
+}
+
+async function persistAnalysisError(
+  projectPath: string,
+  chapterId: number,
+  message: string
+): Promise<void> {
+  await withProjectDbWrite(projectPath, (db) => {
+    db.run(
+      "UPDATE candidate_extractions SET status = 'rejected' WHERE chapter_id = ? AND kind = 'error' AND status = 'error'",
+      [chapterId]
+    );
+    db.run(
+      "INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status, error) VALUES (?, 'error', '{}', 'error', ?)",
+      [chapterId, message]
+    );
+  });
+}
+
+function isAnalysisCancelled(runtime: AnalysisRuntime): boolean {
+  return runtime.state.status === 'cancelled';
+}
+async function runAnalysisWorker(projectPath: string, runtime: AnalysisRuntime): Promise<void> {
+  while (runtime.nextIndex < runtime.chapters.length) {
+    while (runtime.state.status === 'paused') {
+      await abortableDelay(200);
+      if (isAnalysisCancelled(runtime)) return;
+    }
+    if (runtime.state.status !== 'running') return;
+
+    const chapter = runtime.chapters[runtime.nextIndex];
+    runtime.nextIndex += 1;
+    runtime.activeTitles.add(chapter.title);
+    const controller = new AbortController();
+    runtime.abortControllers.add(controller);
+    runtime.state.updatedAt = new Date().toISOString();
+    await persistAnalysisProgress(projectPath, runtime);
+
+    try {
+      const extraction = await callChapterWithRetry(runtime.config, chapter, controller.signal);
+      if (!isAnalysisCancelled(runtime)) {
+        await persistAnalysisCandidate(projectPath, chapter.id, extraction);
+        runtime.state.completed += 1;
+      }
+    } catch (error) {
+      if (!isAnalysisCancelled(runtime) && !controller.signal.aborted) {
+        const message = error instanceof Error ? error.message : String(error);
+        runtime.state.failed += 1;
+        runtime.state.errors = [...runtime.state.errors, chapter.title + ': ' + message].slice(-20);
+        await persistAnalysisError(projectPath, chapter.id, message);
+      }
+    } finally {
+      runtime.activeTitles.delete(chapter.title);
+      runtime.abortControllers.delete(controller);
+      runtime.state.updatedAt = new Date().toISOString();
+      await persistAnalysisProgress(projectPath, runtime);
+    }
+  }
+}
+
+async function runAnalysisJob(projectPath: string, runtime: AnalysisRuntime): Promise<void> {
+  try {
+    const workerCount = Math.min(analysisConcurrency, runtime.chapters.length);
+    await Promise.all(Array.from({ length: workerCount }, () => runAnalysisWorker(projectPath, runtime)));
+    if (runtime.state.status === 'running') {
+      runtime.state.status = runtime.state.failed === runtime.state.total && runtime.state.total > 0
+        ? 'error'
+        : 'completed';
+    }
+  } catch (error) {
+    runtime.state.status = 'error';
+    runtime.state.errors = [
+      ...runtime.state.errors,
+      error instanceof Error ? error.message : String(error)
+    ].slice(-20);
+  } finally {
+    runtime.activeTitles.clear();
+    runtime.state.elapsedMs = runtime.state.startedAt
+      ? Date.now() - Date.parse(runtime.state.startedAt)
+      : runtime.state.elapsedMs;
+    runtime.state.updatedAt = new Date().toISOString();
+    await persistAnalysisProgress(projectPath, runtime);
+  }
+}
+
+async function startAnalysisJob(
+  projectPath: string,
+  upToChapterId?: number | null
+): Promise<AnalysisProgress> {
+  const active = analysisJobs.get(projectPath);
+  if (active && (active.state.status === 'running' || active.state.status === 'paused')) {
+    return analysisSnapshot(active);
+  }
+
+  const config = await readLlmConfig(projectPath);
+  if (config.provider !== 'ollama' && !config.apiKey.trim()) {
+    throw new Error('请先点击“模型”，填写 DeepSeek API Key，保存后再生成谱系图。');
+  }
+
+  const db = await openDb(projectPath);
+  const limitOrder = upToChapterId
+    ? scalar<number>(db, 'SELECT order_index FROM chapters WHERE id = ?', [upToChapterId])
+    : null;
+  if (upToChapterId && limitOrder === null) {
+    await saveDb(projectPath, db);
+    throw new Error('章节不存在。');
+  }
+  const chapters = query<Chapter>(
+    db,
+    "SELECT c.* FROM chapters c WHERE (? IS NULL OR c.order_index <= ?) AND NOT EXISTS (SELECT 1 FROM candidate_extractions ce WHERE ce.chapter_id = c.id AND ce.kind = 'batch' AND ce.status IN ('pending', 'confirmed')) ORDER BY c.order_index ASC, c.id ASC",
+    [limitOrder, limitOrder],
+    (row) => ({
+      id: Number(row.id),
+      title: String(row.title),
+      orderIndex: Number(row.order_index),
+      content: String(row.content),
+      sourceFile: String(row.source_file),
+      contentLength: String(row.content).length
+    })
+  );
+  await saveDb(projectPath, db);
+
+  const now = new Date().toISOString();
+  const runtime: AnalysisRuntime = {
+    state: {
+      status: chapters.length ? 'running' : 'completed',
+      targetChapterId: upToChapterId ?? null,
+      targetOrderIndex: limitOrder,
+      total: chapters.length,
+      completed: 0,
+      failed: 0,
+      remaining: chapters.length,
+      activeChapterTitles: [],
+      errors: [],
+      startedAt: now,
+      updatedAt: now,
+      elapsedMs: 0,
+      estimatedRemainingMs: null,
+      concurrency: analysisConcurrency
+    },
+    chapters,
+    config,
+    nextIndex: 0,
+    activeTitles: new Set(),
+    abortControllers: new Set(),
+    persistQueue: Promise.resolve()
+  };
+  analysisJobs.set(projectPath, runtime);
+  await persistAnalysisProgress(projectPath, runtime);
+  if (chapters.length) void runAnalysisJob(projectPath, runtime);
+  return analysisSnapshot(runtime);
+}
+
+async function pauseAnalysisJob(projectPath: string): Promise<AnalysisProgress> {
+  const runtime = analysisJobs.get(projectPath);
+  if (!runtime) return readAnalysisProgress(projectPath);
+  if (runtime.state.status === 'running') runtime.state.status = 'paused';
+  runtime.state.updatedAt = new Date().toISOString();
+  await persistAnalysisProgress(projectPath, runtime);
+  return analysisSnapshot(runtime);
+}
+
+async function resumeAnalysisJob(projectPath: string): Promise<AnalysisProgress> {
+  const runtime = analysisJobs.get(projectPath);
+  if (runtime && runtime.state.status === 'paused') {
+    runtime.state.status = 'running';
+    runtime.state.updatedAt = new Date().toISOString();
+    await persistAnalysisProgress(projectPath, runtime);
+    return analysisSnapshot(runtime);
+  }
+  const stored = await readAnalysisProgress(projectPath);
+  return startAnalysisJob(projectPath, stored.targetChapterId);
+}
+
+async function cancelAnalysisJob(projectPath: string): Promise<AnalysisProgress> {
+  const runtime = analysisJobs.get(projectPath);
+  if (!runtime) return readAnalysisProgress(projectPath);
+  runtime.state.status = 'cancelled';
+  runtime.state.elapsedMs = runtime.state.startedAt
+    ? Date.now() - Date.parse(runtime.state.startedAt)
+    : runtime.state.elapsedMs;
+  runtime.state.updatedAt = new Date().toISOString();
+  runtime.abortControllers.forEach((controller) => controller.abort());
+  await persistAnalysisProgress(projectPath, runtime);
+  return analysisSnapshot(runtime);
+}
 function findCharacterId(db: Database, name: string, aliases: string[]): number | null {
   const byName = scalar<number>(db, 'SELECT id FROM characters WHERE name = ? LIMIT 1', [name]);
   if (byName) return byName;
@@ -913,7 +1328,7 @@ ipcMain.handle('llm:analyze-chapter', async (_event, projectPath: string, chapte
     throw new Error('章节不存在。');
   }
   try {
-    const extraction = await callLlm(config, chapter);
+    const extraction = await callChapterWithRetry(config, chapter);
     db.run(
       `INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status)
        VALUES (?, 'batch', ?, 'pending')`,
@@ -931,79 +1346,38 @@ ipcMain.handle('llm:analyze-chapter', async (_event, projectPath: string, chapte
 });
 
 ipcMain.handle('llm:analyze-novel', async (_event, projectPath: string, upToChapterId?: number | null) => {
-  const config = await readLlmConfig(projectPath);
-  if (config.provider !== 'ollama' && !config.apiKey.trim()) {
-    throw new Error('请先点击“模型”，填写 DeepSeek API Key，保存后再生成谱系图。');
+  let progress = await startAnalysisJob(projectPath, upToChapterId);
+  while (progress.status === 'running') {
+    await abortableDelay(200);
+    progress = await readAnalysisProgress(projectPath);
   }
-  const db = await openDb(projectPath);
-  const limitOrder = upToChapterId
-    ? scalar<number>(db, 'SELECT order_index FROM chapters WHERE id = ?', [upToChapterId])
-    : null;
-  if (upToChapterId && limitOrder === null) {
-    await saveDb(projectPath, db);
-    throw new Error('章节不存在。');
-  }
-  const chapters = query<Chapter>(
-    db,
-    `SELECT c.*
-     FROM chapters c
-     WHERE (? IS NULL OR c.order_index <= ?)
-       AND NOT EXISTS (
-       SELECT 1 FROM candidate_extractions ce
-       WHERE ce.chapter_id = c.id
-         AND (
-           (ce.kind = 'batch' AND ce.status = 'confirmed')
-           OR ce.kind = 'error'
-         )
-     )
-     ORDER BY c.order_index ASC, c.id ASC`,
-    [limitOrder, limitOrder],
-    (row) => ({
-      id: Number(row.id),
-      title: String(row.title),
-      orderIndex: Number(row.order_index),
-      content: String(row.content),
-      sourceFile: String(row.source_file),
-      contentLength: String(row.content).length
-    })
-  );
-  let processed = 0;
-  const errors: string[] = [];
-  for (const chapter of chapters) {
-    try {
-      const extraction = await callLlm(config, chapter);
-      db.run(
-        `INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status)
-         VALUES (?, 'batch', ?, 'pending')`,
-        [chapter.id, JSON.stringify(extraction)]
-      );
-      applyExtraction(db, chapter.id, extraction);
-      db.run(
-        `UPDATE candidate_extractions
-         SET status = 'confirmed'
-         WHERE id = last_insert_rowid()`
-      );
-      processed += 1;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      errors.push(`${chapter.title}: ${message}`);
-      db.run(
-        `INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status, error)
-         VALUES (?, 'error', '{}', 'error', ?)`,
-        [chapter.id, message]
-      );
-      break;
-    }
-  }
-  await saveDb(projectPath, db);
   return {
     graph: await graphData(projectPath),
-    processed,
-    remaining: Math.max(0, chapters.length - processed),
-    errors
+    processed: progress.completed,
+    remaining: progress.remaining,
+    errors: progress.errors
   };
 });
 
+ipcMain.handle('analysis:start', async (_event, projectPath: string, upToChapterId?: number | null) => {
+  return startAnalysisJob(projectPath, upToChapterId);
+});
+
+ipcMain.handle('analysis:progress', async (_event, projectPath: string) => {
+  return readAnalysisProgress(projectPath);
+});
+
+ipcMain.handle('analysis:pause', async (_event, projectPath: string) => {
+  return pauseAnalysisJob(projectPath);
+});
+
+ipcMain.handle('analysis:resume', async (_event, projectPath: string) => {
+  return resumeAnalysisJob(projectPath);
+});
+
+ipcMain.handle('analysis:cancel', async (_event, projectPath: string) => {
+  return cancelAnalysisJob(projectPath);
+});
 ipcMain.handle('candidate:confirm', async (_event, projectPath: string, candidateId: number) => {
   const db = await openDb(projectPath);
   const candidate = query<CandidateExtraction>(
@@ -1033,6 +1407,32 @@ ipcMain.handle('candidate:confirm', async (_event, projectPath: string, candidat
   return graphData(projectPath);
 });
 
+ipcMain.handle('candidate:confirm-pending', async (
+  _event,
+  projectPath: string,
+  upToChapterId?: number | null
+) => {
+  const db = await openDb(projectPath);
+  const limitOrder = upToChapterId
+    ? scalar<number>(db, 'SELECT order_index FROM chapters WHERE id = ?', [upToChapterId])
+    : null;
+  const candidates = query<{ id: number; chapterId: number | null; payload: ExtractionResult }>(
+    db,
+    "SELECT ce.* FROM candidate_extractions ce LEFT JOIN chapters c ON c.id = ce.chapter_id WHERE ce.kind = 'batch' AND ce.status = 'pending' AND (? IS NULL OR c.order_index <= ?) ORDER BY c.order_index ASC, ce.id ASC",
+    [limitOrder, limitOrder],
+    (row) => ({
+      id: Number(row.id),
+      chapterId: row.chapter_id === null ? null : Number(row.chapter_id),
+      payload: safeJson<ExtractionResult>(String(row.payload_json), { characters: [], relationships: [] })
+    })
+  );
+  for (const candidate of candidates) {
+    applyExtraction(db, candidate.chapterId, candidate.payload);
+    db.run("UPDATE candidate_extractions SET status = 'confirmed' WHERE id = ?", [candidate.id]);
+  }
+  await saveDb(projectPath, db);
+  return graphData(projectPath);
+});
 ipcMain.handle('candidate:reject', async (_event, projectPath: string, candidateId: number) => {
   const db = await openDb(projectPath);
   db.run("UPDATE candidate_extractions SET status = 'rejected' WHERE id = ?", [candidateId]);

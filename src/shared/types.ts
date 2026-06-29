@@ -117,6 +117,25 @@ export interface AnalyzeNovelResult {
   errors: string[];
 }
 
+export type AnalysisStatus = 'idle' | 'running' | 'paused' | 'cancelled' | 'completed' | 'error';
+
+export interface AnalysisProgress {
+  status: AnalysisStatus;
+  targetChapterId: number | null;
+  targetOrderIndex: number | null;
+  total: number;
+  completed: number;
+  failed: number;
+  remaining: number;
+  activeChapterTitles: string[];
+  errors: string[];
+  startedAt: string | null;
+  updatedAt: string;
+  elapsedMs: number;
+  estimatedRemainingMs: number | null;
+  concurrency: number;
+}
+
 export interface ExtractionCharacter {
   name: string;
   aliases?: string[];
@@ -160,7 +179,13 @@ export interface AppApi {
   testLlm(config: LlmConfig): Promise<{ ok: boolean; message: string }>;
   analyzeChapter(projectPath: string, chapterId: number): Promise<GraphData>;
   analyzeNovel(projectPath: string, upToChapterId?: number | null): Promise<AnalyzeNovelResult>;
+  startAnalysis(projectPath: string, upToChapterId?: number | null): Promise<AnalysisProgress>;
+  getAnalysisProgress(projectPath: string): Promise<AnalysisProgress>;
+  pauseAnalysis(projectPath: string): Promise<AnalysisProgress>;
+  resumeAnalysis(projectPath: string): Promise<AnalysisProgress>;
+  cancelAnalysis(projectPath: string): Promise<AnalysisProgress>;
   confirmCandidate(projectPath: string, candidateId: number): Promise<GraphData>;
+  confirmPendingCandidates(projectPath: string, upToChapterId?: number | null): Promise<GraphData>;
   rejectCandidate(projectPath: string, candidateId: number): Promise<GraphData>;
   updateCharacter(projectPath: string, character: CharacterNode): Promise<GraphData>;
   updateRelationship(projectPath: string, relationship: RelationshipEdge): Promise<GraphData>;

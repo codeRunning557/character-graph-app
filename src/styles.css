@@ -175,6 +175,101 @@ label {
   margin: 0 14px 14px;
 }
 
+.analysis-progress {
+  margin: 0 14px 14px;
+  padding: 11px;
+  display: grid;
+  gap: 8px;
+  border: 1px solid #d8c9b5;
+  border-radius: 7px;
+  background: #fffaf1;
+}
+
+.analysis-progress-head,
+.analysis-metrics,
+.analysis-controls,
+.candidate-actions {
+  display: flex;
+  align-items: center;
+}
+
+.analysis-progress-head,
+.analysis-metrics {
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: #6c5c4d;
+}
+
+.analysis-progress-head > span:last-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.analysis-state {
+  font-weight: 700;
+  color: #1f766e;
+}
+
+.analysis-state.paused {
+  color: #8b5b19;
+}
+
+.analysis-state.cancelled,
+.analysis-state.error {
+  color: #9f3427;
+}
+
+.progress-track {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #e5dacb;
+}
+
+.progress-track span {
+  display: block;
+  height: 100%;
+  background: #1f766e;
+  transition: width 240ms ease;
+}
+
+.analysis-progress p {
+  margin: 0;
+  overflow: hidden;
+  color: #4c4239;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.analysis-controls {
+  min-height: 26px;
+  gap: 6px;
+}
+
+.analysis-controls button {
+  width: 28px;
+  height: 26px;
+  padding: 0;
+}
+
+.analysis-controls > span {
+  margin-left: auto;
+  color: #6c5c4d;
+  font-size: 11px;
+}
+
+.candidate-actions {
+  gap: 7px;
+}
+
+.candidate-actions button {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 11px;
+}
 .rail-section {
   min-height: 0;
   padding: 0 10px 12px;
@@ -309,10 +404,10 @@ label {
 
 .empty-state {
   position: absolute;
-  left: 50%;
-  top: 50%;
-  width: min(520px, 72%);
-  transform: translate(-50%, -50%);
+  inset: 0;
+  width: min(560px, 88%);
+  height: max-content;
+  margin: auto;
   text-align: center;
   color: #4c4239;
   pointer-events: none;
@@ -324,8 +419,8 @@ label {
 
 .empty-state h1 {
   margin: 16px 0 8px;
-  font-size: 30px;
-  line-height: 1.2;
+  font-size: 26px;
+  line-height: 1.25;
   letter-spacing: 0;
 }
 
@@ -338,6 +433,7 @@ label {
 .statusbar {
   display: flex;
   align-items: center;
+  min-width: 0;
   gap: 8px;
   padding: 0 16px;
   border-top: 1px solid #ded4c5;
@@ -346,6 +442,11 @@ label {
   background: #fbf8f2;
 }
 
+.statusbar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .spin {
   animation: spin 900ms linear infinite;
 }

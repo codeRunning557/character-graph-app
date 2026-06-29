@@ -45,3 +45,5 @@ web-data/
 Thumbs.db
 .idea/
 .vscode/
+analysis.state.json
+*~[0-9]*

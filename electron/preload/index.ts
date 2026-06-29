@@ -16,8 +16,16 @@ const api: AppApi = {
     ipcRenderer.invoke('llm:analyze-chapter', projectPath, chapterId),
   analyzeNovel: (projectPath: string, upToChapterId?: number | null) =>
     ipcRenderer.invoke('llm:analyze-novel', projectPath, upToChapterId),
+  startAnalysis: (projectPath: string, upToChapterId?: number | null) =>
+    ipcRenderer.invoke('analysis:start', projectPath, upToChapterId),
+  getAnalysisProgress: (projectPath: string) => ipcRenderer.invoke('analysis:progress', projectPath),
+  pauseAnalysis: (projectPath: string) => ipcRenderer.invoke('analysis:pause', projectPath),
+  resumeAnalysis: (projectPath: string) => ipcRenderer.invoke('analysis:resume', projectPath),
+  cancelAnalysis: (projectPath: string) => ipcRenderer.invoke('analysis:cancel', projectPath),
   confirmCandidate: (projectPath: string, candidateId: number) =>
     ipcRenderer.invoke('candidate:confirm', projectPath, candidateId),
+  confirmPendingCandidates: (projectPath: string, upToChapterId?: number | null) =>
+    ipcRenderer.invoke('candidate:confirm-pending', projectPath, upToChapterId),
   rejectCandidate: (projectPath: string, candidateId: number) =>
     ipcRenderer.invoke('candidate:reject', projectPath, candidateId),
   updateCharacter: (projectPath: string, character: CharacterNode) =>

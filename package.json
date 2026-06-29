@@ -1,6 +1,6 @@
 {
   "name": "character-graph-app",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Local character relationship graph workspace for novel authors.",
   "author": "Local Author",
   "main": "out/main/index.js",
@@ -12,12 +12,12 @@
     "build:web": "npm run build",
     "web": "node web/server.mjs",
     "clean:release": "node scripts/clean-release.mjs",
+    "smoke:analysis": "npm run build:web && node scripts/smoke-analysis.mjs",
     "smoke:electron": "npm run build && node scripts/smoke-electron.mjs",
     "smoke:packaged": "node scripts/smoke-packaged.mjs",
     "dist:win": "npm run clean:release && npm run build && electron-builder --win nsis --publish never"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^5.1.2",
     "chardet": "^2.1.1",
     "cytoscape": "^3.33.1",
     "electron-store": "^11.0.2",
@@ -35,6 +35,7 @@
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@types/sql.js": "^1.4.10",
+    "@vitejs/plugin-react": "^5.2.0",
     "electron": "^39.2.7",
     "electron-builder": "^26.0.12",
     "electron-vite": "^4.0.0",

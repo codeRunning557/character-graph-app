@@ -3,19 +3,24 @@ import cytoscape, { type Core, type EventObject } from 'cytoscape';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Check,
+  CheckCheck,
   ChevronDown,
   CircleAlert,
   FileInput,
   FolderOpen,
   GitBranch,
   Loader2,
+  Pause,
   Play,
   Save,
   Settings,
   Sparkles,
-  Trash2
+  Timer,
+  Trash2,
+  X
 } from 'lucide-react';
 import type {
+  AnalysisProgress,
   BondEvent,
   CandidateExtraction,
   Chapter,
@@ -64,6 +69,8 @@ export function App(): ReactElement {
   const [config, setConfig] = useState<LlmConfig>(defaultConfig);
   const [presets, setPresets] = useState<LlmPreset[]>([]);
   const [showSettings, setShowSettings] = useState(false);
+  const [analysis, setAnalysis] = useState<AnalysisProgress | null>(null);
+  const analysisSyncedAt = useRef('');
   const cyRef = useRef<Core | null>(null);
   const graphHost = useRef<HTMLDivElement | null>(null);
 
@@ -81,6 +88,66 @@ export function App(): ReactElement {
     });
   }, []);
 
+  useEffect(() => {
+    analysisSyncedAt.current = '';
+    if (!project) {
+      setAnalysis(null);
+      return;
+    }
+    let disposed = false;
+    let timer: number | null = null;
+
+    const poll = async (): Promise<void> => {
+      try {
+        const progress = await window.characterGraph.getAnalysisProgress(project.path);
+        if (disposed) return;
+        setAnalysis(progress);
+        if (progress.status === 'running' || progress.status === 'paused') {
+          const active = progress.activeChapterTitles.length
+            ? '；正在处理：' + progress.activeChapterTitles.join('、')
+            : '';
+          setStatus(
+            (progress.status === 'paused' ? '已暂停：' : '正在分析：') +
+            (progress.completed + progress.failed) + '/' + progress.total + ' 章，' +
+            '耗时 ' + formatDuration(progress.elapsedMs) +
+            (progress.estimatedRemainingMs ? '，预计剩余 ' + formatDuration(progress.estimatedRemainingMs) : '') +
+            active
+          );
+        }
+        if (
+          ['completed', 'cancelled', 'error'].includes(progress.status) &&
+          progress.updatedAt !== analysisSyncedAt.current
+        ) {
+          analysisSyncedAt.current = progress.updatedAt;
+          const data = await window.characterGraph.loadProject(project.path);
+          if (disposed) return;
+          setGraph(data);
+          const resultText = progress.status === 'cancelled'
+            ? '任务已取消'
+            : progress.status === 'error'
+              ? '任务失败'
+              : '分析完成';
+          setStatus(
+            resultText + '：成功 ' + progress.completed + ' 章，失败 ' + progress.failed + ' 章，' +
+            '耗时 ' + formatDuration(progress.elapsedMs) + '。' +
+            (data.candidates.some((candidate) => candidate.status === 'pending')
+              ? '请确认候选后生成正式图谱。'
+              : '')
+          );
+        }
+      } catch (error) {
+        if (!disposed) setStatus(error instanceof Error ? error.message : String(error));
+      } finally {
+        if (!disposed) timer = window.setTimeout(() => void poll(), 700);
+      }
+    };
+
+    void poll();
+    return () => {
+      disposed = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [project]);
   useEffect(() => {
     if (!graphHost.current) return;
     const cy = cytoscape({
@@ -239,6 +306,14 @@ export function App(): ReactElement {
     [scopedGraph.events, selectedRelationship]
   );
   const pendingCandidates = graph.candidates.filter((candidate) => candidate.status === 'pending');
+  const analysisRunning = analysis?.status === 'running';
+  const analysisPaused = analysis?.status === 'paused';
+  const analysisVisible = analysis && analysis.status !== 'idle';
+  const analysisPercent = analysis && analysis.total > 0
+    ? Math.min(100, Math.round(((analysis.completed + analysis.failed) / analysis.total) * 100))
+    : analysis?.status === 'completed'
+      ? 100
+      : 0;
 
   async function runTask<T>(message: string, task: () => Promise<T>): Promise<T | null> {
     setBusy(true);
@@ -293,28 +368,54 @@ export function App(): ReactElement {
 
   async function analyzeNovel(): Promise<void> {
     if (!project) return;
-    const startedAt = performance.now();
-    const targetChapter = chapterLimit;
-    const targetText = targetChapter ? `第 1-${targetChapter.orderIndex} 章` : '全书';
-    const result = await runTask(`正在生成谱系图：范围 ${targetText}，一次补齐所有未入图章节`, () =>
-      window.characterGraph.analyzeNovel(project.path, targetChapter?.id ?? null)
-    );
-    if (result) {
-      setGraph(result.graph);
-      if (targetChapter) setChapterLimitId(targetChapter.id);
-      const elapsedSeconds = (performance.now() - startedAt) / 1000;
-      const elapsedText =
-        elapsedSeconds < 60
-          ? `${elapsedSeconds.toFixed(1)} 秒`
-          : `${(elapsedSeconds / 60).toFixed(2)} 分钟`;
+    try {
+      const progress = analysisPaused
+        ? await window.characterGraph.resumeAnalysis(project.path)
+        : await window.characterGraph.startAnalysis(project.path, chapterLimit?.id ?? null);
+      setAnalysis(progress);
+      analysisSyncedAt.current = '';
       setStatus(
-        result.errors.length
-          ? `范围 ${targetText}：本次处理 ${result.processed} 章，剩余 ${result.remaining} 章，耗时 ${elapsedText}；错误：${result.errors[0]}`
-          : `范围 ${targetText}：本次处理 ${result.processed} 章，剩余 ${result.remaining} 章，耗时 ${elapsedText}。`
+        progress.total
+          ? '分析任务已启动：3 路并发，失败章节自动重试，结果将进入候选区。'
+          : '所选范围内没有需要重新分析的章节。'
       );
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
     }
   }
 
+  async function pauseAnalysis(): Promise<void> {
+    if (!project) return;
+    const progress = await window.characterGraph.pauseAnalysis(project.path);
+    setAnalysis(progress);
+  }
+
+  async function resumeAnalysis(): Promise<void> {
+    if (!project) return;
+    const progress = await window.characterGraph.resumeAnalysis(project.path);
+    setAnalysis(progress);
+  }
+
+  async function cancelAnalysis(): Promise<void> {
+    if (!project) return;
+    const progress = await window.characterGraph.cancelAnalysis(project.path);
+    setAnalysis(progress);
+  }
+
+  async function confirmPendingCandidates(): Promise<void> {
+    if (!project || !pendingCandidates.length) return;
+    const data = await runTask('正在批量确认候选并生成正式图谱', () =>
+      window.characterGraph.confirmPendingCandidates(project.path, chapterLimit?.id ?? null)
+    );
+    if (data) {
+      setGraph(data);
+      setStatus(
+        '已确认候选，正式图谱已更新' +
+        (analysis ? '；本次生成耗时 ' + formatDuration(analysis.elapsedMs) : '') +
+        '。'
+      );
+    }
+  }
   async function analyzeChapter(chapterId: number): Promise<void> {
     if (!project) return;
     const data = await runTask('正在调用模型分析章节', () =>
@@ -411,10 +512,55 @@ export function App(): ReactElement {
           导入 TXT / MD
         </button>
 
-        <button className="wide-action" disabled={!project || !graph.chapters.length || busy} onClick={analyzeNovel}>
-          <Sparkles size={17} />
-          生成/继续谱系图
+        <button
+          className="wide-action"
+          disabled={!project || !graph.chapters.length || busy || analysisRunning}
+          onClick={analysisPaused ? resumeAnalysis : analyzeNovel}
+        >
+          {analysisRunning ? <Loader2 className="spin" size={17} /> : <Sparkles size={17} />}
+          {analysisRunning ? '正在生成谱系图' : analysisPaused ? '继续生成谱系图' : '生成/继续谱系图'}
         </button>
+
+        {analysisVisible && (
+          <section className="analysis-progress" aria-label="分析进度">
+            <div className="analysis-progress-head">
+              <span className={'analysis-state ' + analysis.status}>{analysisStatusText(analysis.status)}</span>
+              <span><Timer size={13} />{formatDuration(analysis.elapsedMs)}</span>
+            </div>
+            <div className="progress-track" aria-label={'完成 ' + analysisPercent + '%'}>
+              <span style={{ width: analysisPercent + '%' }} />
+            </div>
+            <div className="analysis-metrics">
+              <span>{analysis.completed + analysis.failed}/{analysis.total} 章</span>
+              <span>{analysis.failed ? analysis.failed + ' 章失败' : analysis.concurrency + ' 路并发'}</span>
+            </div>
+            {analysis.activeChapterTitles.length > 0 && (
+              <p title={analysis.activeChapterTitles.join('、')}>
+                {analysis.activeChapterTitles.join('、')}
+              </p>
+            )}
+            <div className="analysis-controls">
+              {analysisRunning && (
+                <button title="暂停分析" aria-label="暂停分析" onClick={pauseAnalysis}>
+                  <Pause size={15} />
+                </button>
+              )}
+              {analysisPaused && (
+                <button title="继续分析" aria-label="继续分析" onClick={resumeAnalysis}>
+                  <Play size={15} />
+                </button>
+              )}
+              {(analysisRunning || analysisPaused) && (
+                <button title="取消分析" aria-label="取消分析" onClick={cancelAnalysis}>
+                  <X size={15} />
+                </button>
+              )}
+              {analysis.estimatedRemainingMs !== null && analysisRunning && (
+                <span>约剩 {formatDuration(analysis.estimatedRemainingMs)}</span>
+              )}
+            </div>
+          </section>
+        )}
 
         <section className="rail-section">
           <div className="section-title">
@@ -444,7 +590,17 @@ export function App(): ReactElement {
         <section className="rail-section candidates">
           <div className="section-title">
             <span>候选</span>
-            <small>{pendingCandidates.length}</small>
+            <div className="candidate-actions">
+              <small>{pendingCandidates.length}</small>
+              <button
+                title="确认当前范围内全部候选"
+                disabled={!pendingCandidates.length || busy || analysisRunning || analysisPaused}
+                onClick={confirmPendingCandidates}
+              >
+                <CheckCheck size={14} />
+                确认全部
+              </button>
+            </div>
           </div>
           <div className="scroll-list">
             {graph.candidates.slice(0, 30).map((candidate) => (
@@ -473,7 +629,7 @@ export function App(): ReactElement {
             </span>
           </div>
           <div className="top-actions">
-            <button disabled={busy} onClick={() => setShowSettings(true)}>
+            <button disabled={busy || analysisRunning || analysisPaused} onClick={() => setShowSettings(true)}>
               <Settings size={16} />
               模型
             </button>
@@ -793,6 +949,27 @@ function Header({ title, meta }: { title: string; meta: string }): ReactElement 
   );
 }
 
+function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return seconds + ' 秒';
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes < 60) return rest ? minutes + ' 分 ' + rest + ' 秒' : minutes + ' 分钟';
+  const hours = Math.floor(minutes / 60);
+  return hours + ' 小时 ' + (minutes % 60) + ' 分';
+}
+
+function analysisStatusText(status: AnalysisProgress['status']): string {
+  const labels: Record<AnalysisProgress['status'], string> = {
+    idle: '未开始',
+    running: '分析中',
+    paused: '已暂停',
+    cancelled: '已取消',
+    completed: '已完成',
+    error: '有错误'
+  };
+  return labels[status];
+}
 function splitTags(value: string): string[] {
   return value
     .split(/[，,]/)

@@ -14,7 +14,13 @@ const dataRoot = process.env.CHARACTER_GRAPH_WEB_DATA || path.join(root, 'web-da
 const projectsRoot = path.join(dataRoot, 'projects');
 const configFile = path.join(dataRoot, 'model.config.json');
 const llmRequestTimeoutMs = 60_000;
+const analysisConcurrency = 3;
+const analysisMaxRetries = 2;
+const analysisChunkSize = 15_000;
+const analysisChunkOverlap = 500;
 let SQL = null;
+const analysisJobs = new Map();
+const projectWriteQueues = new Map();
 
 const presets = [
   {
@@ -88,6 +94,89 @@ function dbPath(projectPath) {
 
 function projectMetaPath(projectPath) {
   return path.join(projectDir(projectPath), 'project.json');
+}
+
+function analysisStatePath(projectPath) {
+  return path.join(projectDir(projectPath), 'analysis.state.json');
+}
+
+function idleAnalysisProgress() {
+  return {
+    status: 'idle',
+    targetChapterId: null,
+    targetOrderIndex: null,
+    total: 0,
+    completed: 0,
+    failed: 0,
+    remaining: 0,
+    activeChapterTitles: [],
+    errors: [],
+    startedAt: null,
+    updatedAt: new Date().toISOString(),
+    elapsedMs: 0,
+    estimatedRemainingMs: null,
+    concurrency: analysisConcurrency
+  };
+}
+
+function analysisSnapshot(runtime) {
+  const state = runtime.state;
+  const active = state.status === 'running' || state.status === 'paused';
+  const elapsedMs = active && state.startedAt
+    ? Math.max(state.elapsedMs, Date.now() - Date.parse(state.startedAt))
+    : state.elapsedMs;
+  const finished = state.completed + state.failed;
+  const averageMs = finished > 0 ? elapsedMs / finished : 0;
+  return {
+    ...state,
+    elapsedMs,
+    remaining: Math.max(0, state.total - finished),
+    activeChapterTitles: [...runtime.activeTitles],
+    estimatedRemainingMs: averageMs > 0
+      ? Math.round((Math.max(0, state.total - finished) * averageMs) / analysisConcurrency)
+      : null
+  };
+}
+
+async function persistAnalysisProgress(projectPath, runtime) {
+  const snapshot = analysisSnapshot(runtime);
+  runtime.state = snapshot;
+  const payload = JSON.stringify(snapshot, null, 2);
+  runtime.persistQueue = runtime.persistQueue
+    .catch(() => undefined)
+    .then(() => writeFile(analysisStatePath(projectPath), payload, 'utf8'));
+  await runtime.persistQueue;
+}
+
+async function readAnalysisProgress(projectPath) {
+  const runtime = analysisJobs.get(projectPath);
+  if (runtime) return analysisSnapshot(runtime);
+  if (!existsSync(analysisStatePath(projectPath))) return idleAnalysisProgress();
+  const stored = {
+    ...idleAnalysisProgress(),
+    ...JSON.parse(await readFile(analysisStatePath(projectPath), 'utf8'))
+  };
+  if (stored.status === 'running') stored.status = 'paused';
+  return stored;
+}
+
+async function withProjectDbWrite(projectPath, action) {
+  const previous = projectWriteQueues.get(projectPath) ?? Promise.resolve();
+  let release = () => undefined;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.catch(() => undefined).then(() => gate);
+  projectWriteQueues.set(projectPath, queued);
+  await previous.catch(() => undefined);
+  try {
+    const db = await openDb(projectPath);
+    action(db);
+    await saveDb(projectPath, db);
+  } finally {
+    release();
+    if (projectWriteQueues.get(projectPath) === queued) projectWriteQueues.delete(projectPath);
+  }
 }
 
 async function openDb(projectPath) {
@@ -401,7 +490,7 @@ statusEvents 只在原文明确说明人物死亡、退场、封存、离开主�
 章节标题：${chapter.title}
 
 章节正文：
-${chapter.content.slice(0, 18000)}`;
+${chapter.content}`;
 }
 
 function parseExtraction(raw) {
@@ -418,7 +507,7 @@ function parseExtraction(raw) {
   };
 }
 
-async function callLlm(config, chapter) {
+async function callLlm(config, chapter, signal) {
   if (config.provider !== 'ollama' && !String(config.apiKey || '').trim()) {
     throw new Error('请先在“模型”里填写 API Key，并点击“保存配置”。');
   }
@@ -428,6 +517,11 @@ async function callLlm(config, chapter) {
     timeout: llmRequestTimeoutMs,
     maxRetries: 0
   });
+  const extraBody = {};
+  if (config.provider === 'deepseek' && config.reasoningMode !== 'off') {
+    extraBody.thinking = { type: 'enabled' };
+    extraBody.reasoning_effort = config.reasoningMode === 'high' ? 'high' : 'medium';
+  }
   const response = await client.chat.completions.create({
     model: config.model,
     temperature: config.temperature,
@@ -436,11 +530,295 @@ async function callLlm(config, chapter) {
     messages: [
       { role: 'system', content: '你只输出可解析 JSON。所有结论必须来自用户提供的小说章节。' },
       { role: 'user', content: extractionPrompt(chapter) }
-    ]
-  });
+    ],
+    ...extraBody
+  }, { signal });
   return parseExtraction(response.choices[0]?.message?.content ?? '');
 }
 
+function splitChapterForAnalysis(chapter) {
+  if (chapter.content.length <= analysisChunkSize) return [chapter];
+  const chunks = [];
+  let start = 0;
+  let part = 1;
+  while (start < chapter.content.length) {
+    let end = Math.min(chapter.content.length, start + analysisChunkSize);
+    if (end < chapter.content.length) {
+      const paragraphBreak = chapter.content.lastIndexOf('\n', end);
+      if (paragraphBreak > start + Math.floor(analysisChunkSize * 0.6)) end = paragraphBreak;
+    }
+    const content = chapter.content.slice(start, end).trim();
+    if (content) {
+      chunks.push({
+        ...chapter,
+        title: chapter.title + '（分段 ' + part + '）',
+        content,
+        contentLength: content.length
+      });
+      part += 1;
+    }
+    if (end >= chapter.content.length) break;
+    start = Math.max(start + 1, end - analysisChunkOverlap);
+  }
+  return chunks;
+}
+
+function mergeExtractions(results) {
+  const characters = new Map();
+  const relationships = new Map();
+  const statusEvents = new Map();
+  for (const result of results) {
+    for (const character of result.characters) {
+      const name = String(character.name || '').trim();
+      if (!name) continue;
+      const existing = characters.get(name);
+      characters.set(name, existing ? {
+        ...existing,
+        aliases: [...new Set([...(existing.aliases ?? []), ...(character.aliases ?? [])])],
+        tags: [...new Set([...(existing.tags ?? []), ...(character.tags ?? [])])],
+        summary: existing.summary || character.summary,
+        evidence: existing.evidence || character.evidence
+      } : character);
+    }
+    for (const relationship of result.relationships) {
+      if (!relationship.source || !relationship.target) continue;
+      const pair = [String(relationship.source).trim(), String(relationship.target).trim()].sort().join('|');
+      const key = pair + '|' + (relationship.type || '未知');
+      const existing = relationships.get(key);
+      relationships.set(key, existing ? {
+        ...existing,
+        strength: Math.max(existing.strength ?? 1, relationship.strength ?? 1),
+        confidence: Math.max(existing.confidence ?? 0, relationship.confidence ?? 0),
+        summary: existing.summary || relationship.summary,
+        evidence: existing.evidence || relationship.evidence,
+        events: [...(existing.events ?? []), ...(relationship.events ?? [])]
+      } : relationship);
+    }
+    for (const event of result.statusEvents ?? []) {
+      if (!event.character || !event.status) continue;
+      statusEvents.set(String(event.character).trim() + '|' + event.status, event);
+    }
+  }
+  return {
+    characters: [...characters.values()],
+    relationships: [...relationships.values()],
+    statusEvents: [...statusEvents.values()]
+  };
+}
+
+function abortableDelay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('分析已取消'));
+      return;
+    }
+    const timeout = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => {
+      clearTimeout(timeout);
+      reject(new Error('分析已取消'));
+    }, { once: true });
+  });
+}
+
+async function callChapterWithRetry(config, chapter, signal) {
+  const results = [];
+  for (const chunk of splitChapterForAnalysis(chapter)) {
+    let lastError = null;
+    for (let attempt = 0; attempt <= analysisMaxRetries; attempt += 1) {
+      try {
+        results.push(await callLlm(config, chunk, signal));
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (signal?.aborted) throw error;
+        if (attempt < analysisMaxRetries) await abortableDelay(1200 * (attempt + 1), signal);
+      }
+    }
+    if (lastError) throw lastError;
+  }
+  return mergeExtractions(results);
+}
+
+async function persistAnalysisCandidate(projectPath, chapterId, extraction) {
+  await withProjectDbWrite(projectPath, (db) => {
+    db.run(
+      "UPDATE candidate_extractions SET status = 'rejected' WHERE chapter_id = ? AND kind = 'error' AND status = 'error'",
+      [chapterId]
+    );
+    db.run(
+      "INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status) VALUES (?, 'batch', ?, 'pending')",
+      [chapterId, JSON.stringify(extraction)]
+    );
+  });
+}
+
+async function persistAnalysisError(projectPath, chapterId, message) {
+  await withProjectDbWrite(projectPath, (db) => {
+    db.run(
+      "UPDATE candidate_extractions SET status = 'rejected' WHERE chapter_id = ? AND kind = 'error' AND status = 'error'",
+      [chapterId]
+    );
+    db.run(
+      "INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status, error) VALUES (?, 'error', '{}', 'error', ?)",
+      [chapterId, message]
+    );
+  });
+}
+
+async function runAnalysisWorker(projectPath, runtime) {
+  while (runtime.nextIndex < runtime.chapters.length) {
+    while (runtime.state.status === 'paused') {
+      await abortableDelay(200);
+      if (runtime.state.status === 'cancelled') return;
+    }
+    if (runtime.state.status !== 'running') return;
+    const chapter = runtime.chapters[runtime.nextIndex];
+    runtime.nextIndex += 1;
+    runtime.activeTitles.add(chapter.title);
+    const controller = new AbortController();
+    runtime.abortControllers.add(controller);
+    runtime.state.updatedAt = new Date().toISOString();
+    await persistAnalysisProgress(projectPath, runtime);
+    try {
+      const extraction = await callChapterWithRetry(runtime.config, chapter, controller.signal);
+      if (runtime.state.status !== 'cancelled') {
+        await persistAnalysisCandidate(projectPath, chapter.id, extraction);
+        runtime.state.completed += 1;
+      }
+    } catch (error) {
+      if (runtime.state.status !== 'cancelled' && !controller.signal.aborted) {
+        const message = error instanceof Error ? error.message : String(error);
+        runtime.state.failed += 1;
+        runtime.state.errors = [...runtime.state.errors, chapter.title + ': ' + message].slice(-20);
+        await persistAnalysisError(projectPath, chapter.id, message);
+      }
+    } finally {
+      runtime.activeTitles.delete(chapter.title);
+      runtime.abortControllers.delete(controller);
+      runtime.state.updatedAt = new Date().toISOString();
+      await persistAnalysisProgress(projectPath, runtime);
+    }
+  }
+}
+
+async function runAnalysisJob(projectPath, runtime) {
+  try {
+    const workerCount = Math.min(analysisConcurrency, runtime.chapters.length);
+    await Promise.all(Array.from({ length: workerCount }, () => runAnalysisWorker(projectPath, runtime)));
+    if (runtime.state.status === 'running') {
+      runtime.state.status = runtime.state.failed === runtime.state.total && runtime.state.total > 0
+        ? 'error'
+        : 'completed';
+    }
+  } catch (error) {
+    runtime.state.status = 'error';
+    runtime.state.errors = [
+      ...runtime.state.errors,
+      error instanceof Error ? error.message : String(error)
+    ].slice(-20);
+  } finally {
+    runtime.activeTitles.clear();
+    runtime.state.elapsedMs = runtime.state.startedAt
+      ? Date.now() - Date.parse(runtime.state.startedAt)
+      : runtime.state.elapsedMs;
+    runtime.state.updatedAt = new Date().toISOString();
+    await persistAnalysisProgress(projectPath, runtime);
+  }
+}
+
+async function startAnalysisJob(projectPath, upToChapterId) {
+  const active = analysisJobs.get(projectPath);
+  if (active && (active.state.status === 'running' || active.state.status === 'paused')) {
+    return analysisSnapshot(active);
+  }
+  const config = await readLlmConfig();
+  if (config.provider !== 'ollama' && !String(config.apiKey || '').trim()) {
+    throw new Error('请先点击“模型”，填写 DeepSeek API Key，保存后再生成谱系图。');
+  }
+  const db = await openDb(projectPath);
+  const limitOrder = upToChapterId ? scalar(db, 'SELECT order_index FROM chapters WHERE id = ?', [upToChapterId]) : null;
+  if (upToChapterId && limitOrder === null) {
+    await saveDb(projectPath, db);
+    throw new Error('章节不存在。');
+  }
+  const chapters = query(db,
+    "SELECT c.* FROM chapters c WHERE (? IS NULL OR c.order_index <= ?) AND NOT EXISTS (SELECT 1 FROM candidate_extractions ce WHERE ce.chapter_id = c.id AND ce.kind = 'batch' AND ce.status IN ('pending', 'confirmed')) ORDER BY c.order_index ASC, c.id ASC",
+    [limitOrder, limitOrder],
+    (row) => ({
+      id: Number(row.id),
+      title: String(row.title),
+      orderIndex: Number(row.order_index),
+      content: String(row.content),
+      sourceFile: String(row.source_file),
+      contentLength: String(row.content).length
+    })
+  );
+  await saveDb(projectPath, db);
+  const now = new Date().toISOString();
+  const runtime = {
+    state: {
+      status: chapters.length ? 'running' : 'completed',
+      targetChapterId: upToChapterId ?? null,
+      targetOrderIndex: limitOrder,
+      total: chapters.length,
+      completed: 0,
+      failed: 0,
+      remaining: chapters.length,
+      activeChapterTitles: [],
+      errors: [],
+      startedAt: now,
+      updatedAt: now,
+      elapsedMs: 0,
+      estimatedRemainingMs: null,
+      concurrency: analysisConcurrency
+    },
+    chapters,
+    config,
+    nextIndex: 0,
+    activeTitles: new Set(),
+    abortControllers: new Set(),
+    persistQueue: Promise.resolve()
+  };
+  analysisJobs.set(projectPath, runtime);
+  await persistAnalysisProgress(projectPath, runtime);
+  if (chapters.length) void runAnalysisJob(projectPath, runtime);
+  return analysisSnapshot(runtime);
+}
+
+async function pauseAnalysisJob(projectPath) {
+  const runtime = analysisJobs.get(projectPath);
+  if (!runtime) return readAnalysisProgress(projectPath);
+  if (runtime.state.status === 'running') runtime.state.status = 'paused';
+  runtime.state.updatedAt = new Date().toISOString();
+  await persistAnalysisProgress(projectPath, runtime);
+  return analysisSnapshot(runtime);
+}
+
+async function resumeAnalysisJob(projectPath) {
+  const runtime = analysisJobs.get(projectPath);
+  if (runtime && runtime.state.status === 'paused') {
+    runtime.state.status = 'running';
+    runtime.state.updatedAt = new Date().toISOString();
+    await persistAnalysisProgress(projectPath, runtime);
+    return analysisSnapshot(runtime);
+  }
+  const stored = await readAnalysisProgress(projectPath);
+  return startAnalysisJob(projectPath, stored.targetChapterId);
+}
+
+async function cancelAnalysisJob(projectPath) {
+  const runtime = analysisJobs.get(projectPath);
+  if (!runtime) return readAnalysisProgress(projectPath);
+  runtime.state.status = 'cancelled';
+  runtime.state.elapsedMs = runtime.state.startedAt
+    ? Date.now() - Date.parse(runtime.state.startedAt)
+    : runtime.state.elapsedMs;
+  runtime.state.updatedAt = new Date().toISOString();
+  runtime.abortControllers.forEach((controller) => controller.abort());
+  await persistAnalysisProgress(projectPath, runtime);
+  return analysisSnapshot(runtime);
+}
 function findCharacterId(db, name, aliases) {
   const byName = scalar(db, 'SELECT id FROM characters WHERE name = ? LIMIT 1', [name]);
   if (byName) return Number(byName);
@@ -555,48 +933,18 @@ function applyExtraction(db, chapterId, result) {
 }
 
 async function analyzeNovel(projectPath, upToChapterId) {
-  const config = await readLlmConfig();
-  if (config.provider !== 'ollama' && !String(config.apiKey || '').trim()) {
-    throw new Error('请先点击“模型”，填写 DeepSeek API Key，保存后再生成谱系图。');
+  let progress = await startAnalysisJob(projectPath, upToChapterId);
+  while (progress.status === 'running') {
+    await abortableDelay(200);
+    progress = await readAnalysisProgress(projectPath);
   }
-  const db = await openDb(projectPath);
-  const limitOrder = upToChapterId ? scalar(db, 'SELECT order_index FROM chapters WHERE id = ?', [upToChapterId]) : null;
-  const chapters = query(db, `SELECT c.*
-    FROM chapters c
-    WHERE (? IS NULL OR c.order_index <= ?)
-      AND NOT EXISTS (
-        SELECT 1 FROM candidate_extractions ce
-        WHERE ce.chapter_id = c.id
-          AND ((ce.kind = 'batch' AND ce.status = 'confirmed') OR ce.kind = 'error')
-      )
-    ORDER BY c.order_index ASC, c.id ASC`, [limitOrder, limitOrder], (row) => ({
-    id: Number(row.id),
-    title: String(row.title),
-    orderIndex: Number(row.order_index),
-    content: String(row.content),
-    sourceFile: String(row.source_file),
-    contentLength: String(row.content).length
-  }));
-  let processed = 0;
-  const errors = [];
-  for (const chapter of chapters) {
-    try {
-      const extraction = await callLlm(config, chapter);
-      db.run("INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status) VALUES (?, 'batch', ?, 'pending')", [chapter.id, JSON.stringify(extraction)]);
-      applyExtraction(db, chapter.id, extraction);
-      db.run("UPDATE candidate_extractions SET status = 'confirmed' WHERE id = last_insert_rowid()");
-      processed += 1;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      errors.push(`${chapter.title}: ${message}`);
-      db.run("INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status, error) VALUES (?, 'error', '{}', 'error', ?)", [chapter.id, message]);
-      break;
-    }
-  }
-  await saveDb(projectPath, db);
-  return { graph: await graphData(projectPath), processed, remaining: Math.max(0, chapters.length - processed), errors };
+  return {
+    graph: await graphData(projectPath),
+    processed: progress.completed,
+    remaining: progress.remaining,
+    errors: progress.errors
+  };
 }
-
 async function handleApi(req, res, url) {
   const json = async () => {
     const chunks = [];
@@ -618,7 +966,26 @@ async function handleApi(req, res, url) {
       return sendJson(res, { ok: false, message: error instanceof Error ? error.message : String(error) });
     }
   }
-  if (req.method === 'POST' && url.pathname === '/api/projects') {
+  if (req.method === 'GET' && url.pathname.startsWith('/api/analysis/progress/')) {
+    const projectPath = decodeURIComponent(url.pathname.slice('/api/analysis/progress/'.length));
+    return sendJson(res, await readAnalysisProgress(projectPath));
+  }
+  if (req.method === 'POST' && url.pathname === '/api/analysis/start') {
+    const body = await json();
+    return sendJson(res, await startAnalysisJob(body.projectPath, body.upToChapterId ?? null));
+  }
+  if (req.method === 'POST' && url.pathname === '/api/analysis/pause') {
+    const body = await json();
+    return sendJson(res, await pauseAnalysisJob(body.projectPath));
+  }
+  if (req.method === 'POST' && url.pathname === '/api/analysis/resume') {
+    const body = await json();
+    return sendJson(res, await resumeAnalysisJob(body.projectPath));
+  }
+  if (req.method === 'POST' && url.pathname === '/api/analysis/cancel') {
+    const body = await json();
+    return sendJson(res, await cancelAnalysisJob(body.projectPath));
+  }  if (req.method === 'POST' && url.pathname === '/api/projects') {
     const body = await json();
     return sendJson(res, await ensureProject(body.name));
   }
@@ -645,7 +1012,7 @@ async function handleApi(req, res, url) {
       sourceFile: String(row.source_file),
       contentLength: String(row.content).length
     }))[0];
-    const extraction = await callLlm(await readLlmConfig(), chapter);
+    const extraction = await callChapterWithRetry(await readLlmConfig(), chapter);
     db.run("INSERT INTO candidate_extractions (chapter_id, kind, payload_json, status) VALUES (?, 'batch', ?, 'pending')", [body.chapterId, JSON.stringify(extraction)]);
     await saveDb(body.projectPath, db);
     return sendJson(res, await graphData(body.projectPath));
@@ -664,7 +1031,29 @@ async function handleApi(req, res, url) {
     await saveDb(body.projectPath, db);
     return sendJson(res, await graphData(body.projectPath));
   }
-  if (req.method === 'POST' && url.pathname === '/api/candidates/reject') {
+  if (req.method === 'POST' && url.pathname === '/api/candidates/confirm-pending') {
+    const body = await json();
+    const db = await openDb(body.projectPath);
+    const limitOrder = body.upToChapterId
+      ? scalar(db, 'SELECT order_index FROM chapters WHERE id = ?', [body.upToChapterId])
+      : null;
+    const candidates = query(
+      db,
+      "SELECT ce.* FROM candidate_extractions ce LEFT JOIN chapters c ON c.id = ce.chapter_id WHERE ce.kind = 'batch' AND ce.status = 'pending' AND (? IS NULL OR c.order_index <= ?) ORDER BY c.order_index ASC, ce.id ASC",
+      [limitOrder, limitOrder],
+      (row) => ({
+        id: Number(row.id),
+        chapterId: row.chapter_id === null ? null : Number(row.chapter_id),
+        payload: safeJson(String(row.payload_json), { characters: [], relationships: [], statusEvents: [] })
+      })
+    );
+    for (const candidate of candidates) {
+      applyExtraction(db, candidate.chapterId, candidate.payload);
+      db.run("UPDATE candidate_extractions SET status = 'confirmed' WHERE id = ?", [candidate.id]);
+    }
+    await saveDb(body.projectPath, db);
+    return sendJson(res, await graphData(body.projectPath));
+  }  if (req.method === 'POST' && url.pathname === '/api/candidates/reject') {
     const body = await json();
     const db = await openDb(body.projectPath);
     db.run("UPDATE candidate_extractions SET status = 'rejected' WHERE id = ?", [body.candidateId]);
@@ -737,7 +1126,7 @@ async function serveStatic(req, res, url) {
   createReadStream(target).pipe(res);
 }
 
-const server = createServer(async (req, res) => {
+export const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);

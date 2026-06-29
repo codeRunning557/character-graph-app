@@ -1,4 +1,5 @@
 import type {
+  AnalysisProgress,
   AnalyzeNovelResult,
   AppApi,
   CharacterNode,
@@ -75,8 +76,20 @@ export function installWebApi(): void {
       api<GraphData>('/llm/analyze-chapter', { method: 'POST', body: JSON.stringify({ projectPath, chapterId }) }),
     analyzeNovel: (projectPath: string, upToChapterId?: number | null) =>
       api<AnalyzeNovelResult>('/llm/analyze-novel', { method: 'POST', body: JSON.stringify({ projectPath, upToChapterId }) }),
+    startAnalysis: (projectPath: string, upToChapterId?: number | null) =>
+      api<AnalysisProgress>('/analysis/start', { method: 'POST', body: JSON.stringify({ projectPath, upToChapterId }) }),
+    getAnalysisProgress: (projectPath: string) =>
+      api<AnalysisProgress>('/analysis/progress/' + encodeURIComponent(projectPath)),
+    pauseAnalysis: (projectPath: string) =>
+      api<AnalysisProgress>('/analysis/pause', { method: 'POST', body: JSON.stringify({ projectPath }) }),
+    resumeAnalysis: (projectPath: string) =>
+      api<AnalysisProgress>('/analysis/resume', { method: 'POST', body: JSON.stringify({ projectPath }) }),
+    cancelAnalysis: (projectPath: string) =>
+      api<AnalysisProgress>('/analysis/cancel', { method: 'POST', body: JSON.stringify({ projectPath }) }),
     confirmCandidate: (projectPath: string, candidateId: number) =>
       api<GraphData>('/candidates/confirm', { method: 'POST', body: JSON.stringify({ projectPath, candidateId }) }),
+    confirmPendingCandidates: (projectPath: string, upToChapterId?: number | null) =>
+      api<GraphData>('/candidates/confirm-pending', { method: 'POST', body: JSON.stringify({ projectPath, upToChapterId }) }),
     rejectCandidate: (projectPath: string, candidateId: number) =>
       api<GraphData>('/candidates/reject', { method: 'POST', body: JSON.stringify({ projectPath, candidateId }) }),
     updateCharacter: (projectPath: string, character: CharacterNode) =>

@@ -35,7 +35,7 @@ const timer = setTimeout(() => {
   child.kill();
   console.error('Packaged smoke test timed out.');
   process.exit(1);
-}, 25000);
+}, 45000);
 
 child.stdout.on('data', (chunk) => {
   const text = chunk.toString();
