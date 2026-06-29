@@ -9,6 +9,7 @@ import {
   FileInput,
   FolderOpen,
   GitBranch,
+  ListChecks,
   Loader2,
   Pause,
   Play,
@@ -26,6 +27,7 @@ import type {
   Chapter,
   CharacterNode,
   GraphData,
+  ExtractionResult,
   LlmConfig,
   LlmPreset,
   ProjectSummary,
@@ -38,6 +40,60 @@ type Selection =
   | { type: 'chapter'; id: number }
   | { type: 'candidate'; id: number }
   | null;
+
+type DiagnosticStatus = 'not-started' | 'pending' | 'confirmed' | 'rejected' | 'error' | 'mixed';
+
+interface DiagnosticRelationship {
+  source: string;
+  target: string;
+  type: string;
+  summary: string;
+}
+
+interface DiagnosticStatusEvent {
+  character: string;
+  status: string;
+  evidence: string;
+}
+
+interface ChapterDiagnostic {
+  chapter: Chapter;
+  candidateStatus: DiagnosticStatus;
+  candidateIds: number[];
+  pendingCandidates: number;
+  confirmedCandidates: number;
+  rejectedCandidates: number;
+  errorCandidates: number;
+  extractedCharacters: string[];
+  extractedRelationships: DiagnosticRelationship[];
+  extractedStatusEvents: DiagnosticStatusEvent[];
+  confirmedEventCount: number;
+  visibleConfirmedEventCount: number;
+  confirmedRelationshipLabels: string[];
+  hiddenCharacters: string[];
+  errors: string[];
+  note: string;
+}
+
+interface GraphDiagnostics {
+  scopeLabel: string;
+  scopeChapterCount: number;
+  totals: {
+    pendingCandidates: number;
+    confirmedCandidates: number;
+    rejectedCandidates: number;
+    errorCandidates: number;
+    extractedCharacterMentions: number;
+    extractedRelationshipMentions: number;
+    confirmedEvents: number;
+    visibleCharacters: number;
+    visibleRelationships: number;
+    hiddenCharacters: number;
+  };
+  warnings: string[];
+  chapters: ChapterDiagnostic[];
+  hiddenCharacterNames: string[];
+}
 
 const emptyGraph: GraphData = {
   chapters: [],
@@ -69,6 +125,7 @@ export function App(): ReactElement {
   const [config, setConfig] = useState<LlmConfig>(defaultConfig);
   const [presets, setPresets] = useState<LlmPreset[]>([]);
   const [showSettings, setShowSettings] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [analysis, setAnalysis] = useState<AnalysisProgress | null>(null);
   const analysisSyncedAt = useRef('');
   const cyRef = useRef<Core | null>(null);
@@ -230,6 +287,10 @@ export function App(): ReactElement {
   const scopedGraph = useMemo(
     () => buildChapterScopedGraph(graph, chapterLimit),
     [chapterLimit, graph]
+  );
+  const diagnostics = useMemo(
+    () => buildGraphDiagnostics(graph, scopedGraph, chapterLimit),
+    [chapterLimit, graph, scopedGraph]
   );
   useEffect(() => {
     const cy = cyRef.current;
@@ -629,6 +690,10 @@ export function App(): ReactElement {
             </span>
           </div>
           <div className="top-actions">
+            <button disabled={!project || !graph.chapters.length} onClick={() => setShowDiagnostics(true)}>
+              <ListChecks size={16} />
+              诊断
+            </button>
             <button disabled={busy || analysisRunning || analysisPaused} onClick={() => setShowSettings(true)}>
               <Settings size={16} />
               模型
@@ -676,6 +741,18 @@ export function App(): ReactElement {
       </aside>
 
       <AnimatePresence>
+        {showDiagnostics && (
+          <motion.div className="modal-layer" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+            <DiagnosticsPanel
+              diagnostics={diagnostics}
+              onClose={() => setShowDiagnostics(false)}
+              onSelectChapter={(chapter) => {
+                selectChapterScope(chapter);
+                setShowDiagnostics(false);
+              }}
+            />
+          </motion.div>
+        )}
         {showSettings && (
           <motion.div className="modal-layer" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
             <motion.div className="settings-panel" initial={{ y: 18 }} animate={{ y: 0 }} exit={{ y: 18 }}>
@@ -766,6 +843,112 @@ export function App(): ReactElement {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+function DiagnosticsPanel({
+  diagnostics,
+  onClose,
+  onSelectChapter
+}: {
+  diagnostics: GraphDiagnostics;
+  onClose: () => void;
+  onSelectChapter: (chapter: Chapter) => void;
+}): ReactElement {
+  return (
+    <motion.div className="diagnostics-panel" initial={{ y: 18 }} animate={{ y: 0 }} exit={{ y: 18 }}>
+      <div className="modal-title diagnostics-title">
+        <div>
+          <strong>生成诊断</strong>
+          <span>{diagnostics.scopeLabel}</span>
+        </div>
+        <button onClick={onClose}>关闭</button>
+      </div>
+
+      <div className="diagnostic-metrics">
+        <article>
+          <strong>{diagnostics.scopeChapterCount}</strong>
+          <span>范围章节</span>
+        </article>
+        <article>
+          <strong>{diagnostics.totals.pendingCandidates}</strong>
+          <span>待确认</span>
+        </article>
+        <article>
+          <strong>{diagnostics.totals.confirmedCandidates}</strong>
+          <span>已确认候选</span>
+        </article>
+        <article>
+          <strong>{diagnostics.totals.errorCandidates}</strong>
+          <span>错误章节</span>
+        </article>
+        <article>
+          <strong>{diagnostics.totals.visibleCharacters}</strong>
+          <span>图上人物</span>
+        </article>
+        <article>
+          <strong>{diagnostics.totals.visibleRelationships}</strong>
+          <span>图上关系</span>
+        </article>
+      </div>
+
+      {diagnostics.warnings.length > 0 && (
+        <div className="diagnostic-warnings">
+          {diagnostics.warnings.map((warning) => (
+            <p key={warning}>{warning}</p>
+          ))}
+        </div>
+      )}
+
+      <div className="diagnostic-chapters">
+        {diagnostics.chapters.map((item) => (
+          <article className="diagnostic-chapter" key={item.chapter.id}>
+            <button className="diagnostic-row-head" onClick={() => onSelectChapter(item.chapter)}>
+              <span>第 {item.chapter.orderIndex} 章</span>
+              <strong>{item.chapter.title}</strong>
+              <em className={'diagnostic-badge ' + item.candidateStatus}>{diagnosticStatusText(item.candidateStatus)}</em>
+            </button>
+            <div className="diagnostic-row-grid">
+              <span>候选 {item.pendingCandidates + item.confirmedCandidates + item.rejectedCandidates + item.errorCandidates}</span>
+              <span>人物 {item.extractedCharacters.length}</span>
+              <span>关系 {item.extractedRelationships.length}</span>
+              <span>正式事件 {item.confirmedEventCount}</span>
+              <span>图上事件 {item.visibleConfirmedEventCount}</span>
+              <span>{item.note}</span>
+            </div>
+            {item.errors.length > 0 && (
+              <div className="diagnostic-error-list">
+                {item.errors.slice(0, 2).map((error) => <p key={error}>{error}</p>)}
+              </div>
+            )}
+            {item.extractedCharacters.length > 0 && (
+              <div className="diagnostic-line-list">
+                <span>抽取人物</span>
+                <p>{item.extractedCharacters.slice(0, 14).join('、')}</p>
+              </div>
+            )}
+            {item.extractedRelationships.length > 0 && (
+              <div className="diagnostic-line-list">
+                <span>抽取关系</span>
+                <p>{item.extractedRelationships.slice(0, 8).map(relationshipLabel).join('；')}</p>
+              </div>
+            )}
+            {item.confirmedRelationshipLabels.length > 0 && (
+              <div className="diagnostic-line-list">
+                <span>已入图关系</span>
+                <p>{item.confirmedRelationshipLabels.join('；')}</p>
+              </div>
+            )}
+            {item.hiddenCharacters.length > 0 && (
+              <div className="diagnostic-line-list muted">
+                <span>本章隐藏</span>
+                <p>{item.hiddenCharacters.join('、')}</p>
+              </div>
+            )}
+          </article>
+        ))}
+      </div>
+    </motion.div>
   );
 }
 
@@ -975,6 +1158,218 @@ function splitTags(value: string): string[] {
     .split(/[，,]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function buildGraphDiagnostics(graph: GraphData, scopedGraph: GraphData, limit: Chapter | null): GraphDiagnostics {
+  const limitOrderIndex = limit?.orderIndex ?? Number.POSITIVE_INFINITY;
+  const scopeChapters = graph.chapters.filter((chapter) => chapter.orderIndex <= limitOrderIndex);
+  const scopeChapterIds = new Set(scopeChapters.map((chapter) => chapter.id));
+  const candidatesByChapter = new Map<number, CandidateExtraction[]>();
+
+  graph.candidates.forEach((candidate) => {
+    if (candidate.chapterId === null || !scopeChapterIds.has(candidate.chapterId)) return;
+    const current = candidatesByChapter.get(candidate.chapterId) ?? [];
+    current.push(candidate);
+    candidatesByChapter.set(candidate.chapterId, current);
+  });
+
+  const relationshipsById = new Map(graph.relationships.map((relationship) => [relationship.id, relationship]));
+  const visibleRelationshipIds = new Set(scopedGraph.relationships.map((relationship) => relationship.id));
+  const hiddenByChapter = new Map<number, string[]>();
+  const hiddenCharacterNames = uniqueStrings(
+    graph.statusEvents
+      .filter((event) => isInactiveStatus(event.status))
+      .filter((event) => event.chapterId === null || scopeChapterIds.has(event.chapterId))
+      .map((event) => event.characterName)
+  );
+
+  graph.statusEvents.forEach((event) => {
+    if (!isInactiveStatus(event.status) || event.chapterId === null || !scopeChapterIds.has(event.chapterId)) return;
+    const current = hiddenByChapter.get(event.chapterId) ?? [];
+    current.push(event.characterName + '（' + inactiveStatusText(event.status) + '）');
+    hiddenByChapter.set(event.chapterId, uniqueStrings(current));
+  });
+
+  const chapters = scopeChapters.map((chapter): ChapterDiagnostic => {
+    const candidates = candidatesByChapter.get(chapter.id) ?? [];
+    const batchPayloads = candidates
+      .filter((candidate) => candidate.kind === 'batch')
+      .map((candidate) => normalizeExtractionPayload(candidate.payload));
+    const pendingCandidates = candidates.filter((candidate) => candidate.status === 'pending').length;
+    const confirmedCandidates = candidates.filter((candidate) => candidate.status === 'confirmed').length;
+    const rejectedCandidates = candidates.filter((candidate) => candidate.status === 'rejected').length;
+    const errorCandidates = candidates.filter((candidate) => candidate.status === 'error' || candidate.kind === 'error').length;
+    const extractedRelationships = uniqueRelationships(batchPayloads.flatMap((payload) => payload.relationships));
+    const chapterEvents = graph.events.filter((event) => event.chapterId === chapter.id);
+    const confirmedRelationshipLabels = uniqueStrings(chapterEvents.map((event) => {
+      const relationship = relationshipsById.get(event.relationshipId);
+      if (!relationship) return event.summary;
+      return relationship.sourceName + ' - ' + relationship.targetName + '（' + relationship.type + '）';
+    })).slice(0, 10);
+    const visibleConfirmedEventCount = chapterEvents.filter((event) => visibleRelationshipIds.has(event.relationshipId)).length;
+    const errors = candidates.map((candidate) => candidate.error).filter(Boolean);
+    const candidateStatus = chapterDiagnosticStatus(candidates);
+
+    return {
+      chapter,
+      candidateStatus,
+      candidateIds: candidates.map((candidate) => candidate.id),
+      pendingCandidates,
+      confirmedCandidates,
+      rejectedCandidates,
+      errorCandidates,
+      extractedCharacters: uniqueStrings(batchPayloads.flatMap((payload) => payload.characters.map((character) => cleanText(character.name)))).slice(0, 24),
+      extractedRelationships,
+      extractedStatusEvents: batchPayloads.flatMap((payload) => payload.statusEvents ?? []).map((event) => ({
+        character: cleanText(event.character),
+        status: cleanText(event.status),
+        evidence: cleanText(event.evidence ?? '')
+      })).filter((event) => event.character).slice(0, 12),
+      confirmedEventCount: chapterEvents.length,
+      visibleConfirmedEventCount,
+      confirmedRelationshipLabels,
+      hiddenCharacters: hiddenByChapter.get(chapter.id) ?? [],
+      errors,
+      note: diagnosticNote(candidateStatus, extractedRelationships.length, chapterEvents.length, visibleConfirmedEventCount)
+    };
+  });
+
+  const totals = chapters.reduce((acc, chapter) => ({
+    pendingCandidates: acc.pendingCandidates + chapter.pendingCandidates,
+    confirmedCandidates: acc.confirmedCandidates + chapter.confirmedCandidates,
+    rejectedCandidates: acc.rejectedCandidates + chapter.rejectedCandidates,
+    errorCandidates: acc.errorCandidates + chapter.errorCandidates,
+    extractedCharacterMentions: acc.extractedCharacterMentions + chapter.extractedCharacters.length,
+    extractedRelationshipMentions: acc.extractedRelationshipMentions + chapter.extractedRelationships.length,
+    confirmedEvents: acc.confirmedEvents + chapter.confirmedEventCount,
+    visibleCharacters: scopedGraph.characters.length,
+    visibleRelationships: scopedGraph.relationships.length,
+    hiddenCharacters: hiddenCharacterNames.length
+  }), {
+    pendingCandidates: 0,
+    confirmedCandidates: 0,
+    rejectedCandidates: 0,
+    errorCandidates: 0,
+    extractedCharacterMentions: 0,
+    extractedRelationshipMentions: 0,
+    confirmedEvents: 0,
+    visibleCharacters: scopedGraph.characters.length,
+    visibleRelationships: scopedGraph.relationships.length,
+    hiddenCharacters: hiddenCharacterNames.length
+  });
+
+  const warnings: string[] = [];
+  if (scopeChapters.length > 0 && chapters.every((chapter) => chapter.candidateStatus === 'not-started')) {
+    warnings.push('当前范围还没有任何章节候选，说明尚未生成或生成任务没有写入候选区。');
+  }
+  if (totals.pendingCandidates > 0) {
+    warnings.push('还有 ' + totals.pendingCandidates + ' 条候选未确认，未确认内容不会进入正式图谱。');
+  }
+  if (totals.errorCandidates > 0) {
+    warnings.push('有 ' + totals.errorCandidates + ' 条错误记录，需要重跑对应章节。');
+  }
+  if (totals.confirmedCandidates > 0 && scopedGraph.relationships.length === 0) {
+    warnings.push('候选已经确认，但当前图上没有关系线，重点检查状态过滤、章节范围和事件写入。');
+  }
+  if (hiddenCharacterNames.length > 0) {
+    warnings.push('当前范围隐藏了 ' + hiddenCharacterNames.length + ' 个死亡、退场或不再使用的人物。');
+  }
+
+  return {
+    scopeLabel: limit ? '当前范围：第 1-' + limit.orderIndex + ' 章' : '当前范围：全书',
+    scopeChapterCount: scopeChapters.length,
+    totals,
+    warnings,
+    chapters,
+    hiddenCharacterNames
+  };
+}
+
+function normalizeExtractionPayload(payload: unknown): ExtractionResult {
+  const value = payload && typeof payload === 'object' ? payload as Partial<ExtractionResult> : {};
+  return {
+    characters: Array.isArray(value.characters) ? value.characters : [],
+    relationships: Array.isArray(value.relationships) ? value.relationships : [],
+    statusEvents: Array.isArray(value.statusEvents) ? value.statusEvents : []
+  };
+}
+
+function chapterDiagnosticStatus(candidates: CandidateExtraction[]): DiagnosticStatus {
+  if (!candidates.length) return 'not-started';
+  const statuses = new Set(candidates.map((candidate) => candidate.kind === 'error' ? 'error' : candidate.status));
+  if (statuses.has('error')) return 'error';
+  if (statuses.has('pending')) return 'pending';
+  if (statuses.has('confirmed') && statuses.has('rejected')) return 'mixed';
+  if (statuses.has('confirmed')) return 'confirmed';
+  if (statuses.has('rejected')) return 'rejected';
+  return 'mixed';
+}
+
+function diagnosticNote(status: DiagnosticStatus, extractedRelationships: number, confirmedEvents: number, visibleEvents: number): string {
+  if (status === 'not-started') return '未分析';
+  if (status === 'error') return '需要重跑';
+  if (status === 'pending') return '待确认';
+  if (status === 'rejected') return '已驳回';
+  if (confirmedEvents === 0 && extractedRelationships > 0) return '候选未入图';
+  if (confirmedEvents > 0 && visibleEvents === 0) return '被当前过滤隐藏';
+  if (confirmedEvents > 0) return '已入图';
+  return '无关系事件';
+}
+
+function diagnosticStatusText(status: DiagnosticStatus): string {
+  const labels: Record<DiagnosticStatus, string> = {
+    'not-started': '未分析',
+    pending: '待确认',
+    confirmed: '已确认',
+    rejected: '已驳回',
+    error: '错误',
+    mixed: '混合'
+  };
+  return labels[status];
+}
+
+function relationshipLabel(relationship: DiagnosticRelationship): string {
+  return relationship.source + ' - ' + relationship.target + '（' + (relationship.type || '关系') + '）';
+}
+
+function uniqueRelationships(relationships: ExtractionResult['relationships']): DiagnosticRelationship[] {
+  const byKey = new Map<string, DiagnosticRelationship>();
+  relationships.forEach((relationship) => {
+    const source = cleanText(relationship.source);
+    const target = cleanText(relationship.target);
+    if (!source || !target || source === target) return;
+    const ordered = [source, target].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+    const type = cleanText(relationship.type || '关系');
+    const key = ordered[0] + '|' + ordered[1] + '|' + type;
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        source,
+        target,
+        type,
+        summary: cleanText(relationship.summary)
+      });
+    }
+  });
+  return [...byKey.values()].slice(0, 32);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.map(cleanText).filter(Boolean))];
+}
+
+function cleanText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function isInactiveStatus(status: string): boolean {
+  return status === 'dead' || status === 'retired' || status === 'unused';
+}
+
+function inactiveStatusText(status: string): string {
+  if (status === 'dead') return '死亡';
+  if (status === 'retired') return '退场';
+  if (status === 'unused') return '不再使用';
+  return status;
 }
 
 function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): GraphData {

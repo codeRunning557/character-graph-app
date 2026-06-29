@@ -1,6 +1,6 @@
 {
   "name": "character-graph-app",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "Local character relationship graph workspace for novel authors.",
   "author": "Local Author",
   "main": "out/main/index.js",
@@ -15,7 +15,8 @@
     "smoke:analysis": "npm run build:web && node scripts/smoke-analysis.mjs",
     "smoke:electron": "npm run build && node scripts/smoke-electron.mjs",
     "smoke:packaged": "node scripts/smoke-packaged.mjs",
-    "dist:win": "npm run clean:release && npm run build && electron-builder --win nsis --publish never"
+    "dist:win": "npm run clean:release && npm run build && electron-builder --win nsis --publish never",
+    "smoke:diagnostics": "npm run build:web && node scripts/smoke-diagnostics.mjs"
   },
   "dependencies": {
     "chardet": "^2.1.1",
