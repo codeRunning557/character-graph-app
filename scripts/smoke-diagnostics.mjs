@@ -45,6 +45,19 @@ async function request(baseUrl, route, options = {}) {
   return text ? JSON.parse(text) : null;
 }
 
+function requestedChapters(prompt) {
+  const matches = [...prompt.matchAll(/章节ID：(\d+)\n章节序号：(\d+)\n章节标题：([^\n]+)/g)];
+  if (matches.length) {
+    return matches.map((match) => ({
+      chapterId: Number(match[1]),
+      orderIndex: Number(match[2]),
+      title: match[3].trim()
+    }));
+  }
+  const title = new RegExp('章节标题：([^\\n]+)').exec(prompt)?.[1]?.trim() || '未知章节';
+  return [{ chapterId: null, orderIndex: null, title }];
+}
+
 function extractionForTitle(title) {
   const base = {
     characters: [{ name: '主角', aliases: [], summary: '主角', tags: ['主角'], evidence: title }],
@@ -152,14 +165,16 @@ const mockServer = createServer(async (req, res) => {
   for await (const chunk of req) chunks.push(chunk);
   const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
   const prompt = body.messages?.find((message) => message.role === 'user')?.content || '';
-  const title = new RegExp('章节标题：([^\\n]+)').exec(prompt)?.[1]?.trim() || '未知章节';
-  modelCalls.push(title);
-  const extraction = extractionForTitle(title);
+  const chapters = requestedChapters(prompt);
+  modelCalls.push(chapters.map((chapter) => chapter.title));
+  const payload = chapters.length > 1 || chapters[0].chapterId !== null
+    ? { chapters: chapters.map((chapter) => ({ chapterId: chapter.chapterId, chapterTitle: chapter.title, ...extractionForTitle(chapter.title) })) }
+    : extractionForTitle(chapters[0].title);
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({
     id: 'mock-diagnostics',
     object: 'chat.completion',
-    choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(extraction) }, finish_reason: 'stop' }]
+    choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify(payload) }, finish_reason: 'stop' }]
   }));
 });
 
@@ -192,7 +207,7 @@ try {
       apiKey: 'local-diagnostics-key',
       model: 'mock-diagnostics',
       temperature: 0,
-      maxTokens: 1024,
+      maxTokens: 2048,
       supportsJson: true,
       reasoningMode: 'off'
     })
@@ -229,8 +244,9 @@ try {
   }
 
   assert(progress.status === 'completed', 'Analysis did not complete.');
-  assert(modelCalls.length === 3, 'Expected exactly 3 model calls for chapters 1-3.');
-  assert(modelCalls.every((title) => !title.includes('第四章')), 'Chapter 4 should not be analyzed.');
+  assert(modelCalls.length === 1, 'Expected chapters 1-3 to be analyzed in one batch.');
+  assert(modelCalls[0].length === 3, 'Expected exactly 3 chapters in the batch.');
+  assert(modelCalls[0].every((title) => !title.includes('第四章')), 'Chapter 4 should not be analyzed.');
 
   const beforeConfirm = await request(baseUrl, '/api/projects/' + encodeURIComponent(project.path));
   const pending = beforeConfirm.candidates.filter((candidate) => candidate.status === 'pending');
@@ -257,6 +273,7 @@ try {
   console.log(JSON.stringify({
     queuedChapters: progress.total,
     modelCalls: modelCalls.length,
+    batchSize: modelCalls[0].length,
     pendingBeforeConfirm: pending.length,
     confirmedCharacters: confirmed.characters.length,
     confirmedRelationships: confirmed.relationships.length,

@@ -22,18 +22,38 @@ import type {
   RelationshipEdge
 } from '../../src/shared/types';
 
-const llmRequestTimeoutMs = 60_000;
-const analysisConcurrency = 3;
+const llmRequestTimeoutMs = 180_000;
+const analysisConcurrency = 2;
 const analysisMaxRetries = 2;
+const analysisBatchMaxChapters = 50;
+const analysisBatchCharBudget = 250_000;
 const analysisChunkSize = 15_000;
 const analysisChunkOverlap = 500;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let SQL: SqlJsStatic | null = null;
 
+const smokeProfileRoot = process.env.CHARACTER_GRAPH_SMOKE_PROFILE;
+if (smokeProfileRoot) {
+  app.setPath('userData', path.join(smokeProfileRoot, 'user-data'));
+  app.setPath('cache', path.join(smokeProfileRoot, 'cache'));
+  app.setPath('documents', path.join(smokeProfileRoot, 'documents'));
+}
+
+interface AnalysisTask {
+  id: string;
+  chapters: Chapter[];
+  label: string;
+}
+
+interface AnalysisBatchOutcome {
+  results: Map<number, ExtractionResult>;
+  failures: Map<number, string>;
+}
+
 interface AnalysisRuntime {
   state: AnalysisProgress;
-  chapters: Chapter[];
+  tasks: AnalysisTask[];
   config: LlmConfig;
   nextIndex: number;
   activeTitles: Set<string>;
@@ -670,44 +690,108 @@ async function importNovelFile(projectPath: string, filePath: string): Promise<G
 }
 
 function extractionPrompt(chapter: Chapter): string {
-  return `你是小说人物关系抽取器。只根据给定章节文本抽取，不要补充常识，不要编造。
-statusEvents 只在原文明确说明人物死亡、退场、封存、离开主线、后续不再使用时输出；不要因为人物本章未出现就判断 unused。
-
-输出严格 JSON，结构如下：
-{
-  "characters": [
-    {"name": "人物名", "aliases": ["别名"], "summary": "本章中可证实的人物信息", "tags": ["身份或阵营"], "evidence": "原文证据片段"}
-  ],
-  "statusEvents": [
-    {"character": "人物名", "status": "active/dead/retired/unused", "evidence": "原文明确证据片段"}
-  ],
-  "relationships": [
-    {
-      "source": "人物A",
-      "target": "人物B",
-      "type": "师徒/亲族/敌对/盟友/暧昧/主仆/同族/交易/未知等",
-      "summary": "二人关系与羁绊摘要",
-      "strength": 1到5的整数,
-      "confidence": 0到1的小数,
-      "evidence": "原文证据片段",
-      "events": [{"summary": "关键事件", "evidence": "原文证据片段"}]
-    }
-  ]
+  return [
+    '你是小说人物关系抽取器。只根据给定章节文本抽取，不要补充常识，不要编造。statusEvents 只在原文明示人物死亡、退场、封存、离开主线、后续不再使用时输出；不要因为人物本章未出现就判断 unused。',
+    '输出严格 JSON，结构如下：',
+    '{',
+    '  "characters": [',
+    '    {"name": "人物名", "aliases": ["别名"], "summary": "本章中可证实的人物信息", "tags": ["身份或阵营"], "evidence": "原文证据片段"}',
+    '  ],',
+    '  "statusEvents": [',
+    '    {"character": "人物名", "status": "active/dead/retired/unused", "evidence": "原文明示证据片段"}',
+    '  ],',
+    '  "relationships": [',
+    '    {',
+    '      "source": "人物A",',
+    '      "target": "人物B",',
+    '      "type": "师徒/亲族/敌对/盟友/暧昧/主仆/同族/交易/未知等",',
+    '      "summary": "二人关系与羁绊摘要",',
+    '      "strength": 1到5的整数,',
+    '      "confidence": 0到1的小数,',
+    '      "evidence": "原文证据片段",',
+    '      "events": [{"summary": "关键事件", "evidence": "原文证据片段"}]',
+    '    }',
+    '  ]',
+    '}',
+    '',
+    '章节标题：' + chapter.title,
+    '',
+    '章节正文：' + chapter.content
+  ].join('\n');
 }
 
-章节标题：${chapter.title}
+function batchExtractionPrompt(chapters: Chapter[]): string {
+  const chapterTexts = chapters.map((chapter) => [
+    '---',
+    '章节ID：' + chapter.id,
+    '章节序号：' + chapter.orderIndex,
+    '章节标题：' + chapter.title,
+    '章节正文：',
+    chapter.content
+  ].join('\n')).join('\n\n');
 
-章节正文：
-${chapter.content}`;
+  return [
+    '你是小说人物关系抽取器。现在一次给你多章文本，请分别按章节抽取人物、别名、关系、羁绊、事件和人物状态。',
+    '',
+    '硬性规则：',
+    '1. 只根据给定章节原文抽取，不要补充常识，不要编造。',
+    '2. 必须按章节分别返回；每个结果必须带 chapterId，且 chapterId 必须来自输入。',
+    '3. 人物、关系、事件都必须有原文 evidence。',
+    '4. 两个人之间互为朋友、盟友、敌人等，只输出一条关系，不要输出 A->B 和 B->A 两条。',
+    '5. statusEvents 只在原文明示死亡、退场、封存、离开主线、后续不再使用时输出；不要因为人物本批次后续没出现就判断 unused。',
+    '6. 不要把后面章节的信息提前写进前面章节。关系和状态发生在哪一章，就放在哪一章的结果里。',
+    '7. 输出必须是可解析 JSON，不要 Markdown，不要解释文字。',
+    '',
+    '输出结构：',
+    '{',
+    '  "chapters": [',
+    '    {',
+    '      "chapterId": 章节ID数字,',
+    '      "chapterTitle": "章节标题",',
+    '      "characters": [',
+    '        {"name": "人物名", "aliases": ["别名"], "summary": "本章中可证实的人物信息", "tags": ["身份或阵营"], "evidence": "原文证据片段"}',
+    '      ],',
+    '      "statusEvents": [',
+    '        {"character": "人物名", "status": "active/dead/retired/unused", "evidence": "原文明示证据片段"}',
+    '      ],',
+    '      "relationships": [',
+    '        {',
+    '          "source": "人物A",',
+    '          "target": "人物B",',
+    '          "type": "师徒/亲族/敌对/盟友/朋友/暧昧/主仆/同族/交易/未知等",',
+    '          "summary": "二人关系与羁绊摘要",',
+    '          "strength": 1到5的整数,',
+    '          "confidence": 0到1的小数,',
+    '          "evidence": "原文证据片段",',
+    '          "events": [{"summary": "关键事件", "evidence": "原文证据片段"}]',
+    '        }',
+    '      ]',
+    '    }',
+    '  ]',
+    '}',
+    '',
+    '本批次共 ' + chapters.length + ' 章：',
+    chapterTexts
+  ].join('\n');
 }
 
-function parseExtraction(raw: string): ExtractionResult {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenced?.[1] ?? raw;
+function parseJsonObject(raw: string): unknown {
+  const fence = String.fromCharCode(96).repeat(3);
+  let candidate = raw;
+  const fenceStart = raw.indexOf(fence);
+  if (fenceStart >= 0) {
+    const afterFence = raw.slice(fenceStart + fence.length).replace(/^json\s*/i, '');
+    const fenceEnd = afterFence.indexOf(fence);
+    candidate = fenceEnd >= 0 ? afterFence.slice(0, fenceEnd) : afterFence;
+  }
   const first = candidate.indexOf('{');
   const last = candidate.lastIndexOf('}');
   if (first < 0 || last < first) throw new Error('模型没有返回 JSON 对象。');
-  const parsed = JSON.parse(candidate.slice(first, last + 1)) as Partial<ExtractionResult>;
+  return JSON.parse(candidate.slice(first, last + 1));
+}
+
+function normalizeExtraction(value: unknown): ExtractionResult {
+  const parsed = value && typeof value === 'object' ? value as Partial<ExtractionResult> : {};
   return {
     characters: Array.isArray(parsed.characters) ? parsed.characters : [],
     relationships: Array.isArray(parsed.relationships) ? parsed.relationships : [],
@@ -715,7 +799,54 @@ function parseExtraction(raw: string): ExtractionResult {
   };
 }
 
-async function callLlm(config: LlmConfig, chapter: Chapter, signal?: AbortSignal): Promise<ExtractionResult> {
+function parseExtraction(raw: string): ExtractionResult {
+  return normalizeExtraction(parseJsonObject(raw));
+}
+
+function parseBatchExtraction(raw: string, chapters: Chapter[]): Map<number, ExtractionResult> {
+  const parsed = parseJsonObject(raw);
+  const root = parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
+  const items = Array.isArray(root.chapters)
+    ? root.chapters
+    : Array.isArray(root.results)
+      ? root.results
+      : null;
+
+  if (!items && chapters.length === 1) {
+    return new Map([[chapters[0].id, normalizeExtraction(root)]]);
+  }
+  if (!items) throw new Error('模型没有返回 chapters 数组。');
+
+  const byId = new Map(chapters.map((chapter) => [chapter.id, chapter]));
+  const byOrderIndex = new Map(chapters.map((chapter) => [chapter.orderIndex, chapter]));
+  const results = new Map<number, ExtractionResult>();
+
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as Record<string, unknown>;
+    const rawId = record.chapterId ?? record.chapter_id ?? record.id;
+    const rawOrder = record.orderIndex ?? record.order_index ?? record.chapterOrder ?? record.chapter_order;
+    const chapterId = Number(rawId);
+    const orderIndex = Number(rawOrder);
+    const chapter = Number.isFinite(chapterId) && byId.has(chapterId)
+      ? byId.get(chapterId)
+      : Number.isFinite(orderIndex)
+        ? byOrderIndex.get(orderIndex)
+        : undefined;
+    if (!chapter) continue;
+    const current = results.get(chapter.id);
+    const next = normalizeExtraction(record);
+    results.set(chapter.id, current ? mergeExtractions([current, next]) : next);
+  }
+
+  const missing = chapters.filter((chapter) => !results.has(chapter.id));
+  if (missing.length) {
+    throw new Error('模型漏返回章节：' + missing.slice(0, 5).map((chapter) => chapter.title).join('、'));
+  }
+  return results;
+}
+
+async function requestLlm(config: LlmConfig, prompt: string, signal?: AbortSignal): Promise<string> {
   if (config.provider !== 'ollama' && !config.apiKey.trim()) {
     throw new Error('请先在“模型”里填写 API Key，并点击“保存配置”。');
   }
@@ -740,12 +871,19 @@ async function callLlm(config: LlmConfig, chapter: Chapter, signal?: AbortSignal
         role: 'system',
         content: '你只输出可解析 JSON。所有结论必须来自用户提供的小说章节。'
       },
-      { role: 'user', content: extractionPrompt(chapter) }
+      { role: 'user', content: prompt }
     ],
     ...extraBody
   }, { signal });
-  const content = response.choices[0]?.message?.content ?? '';
-  return parseExtraction(content);
+  return response.choices[0]?.message?.content ?? '';
+}
+
+async function callLlm(config: LlmConfig, chapter: Chapter, signal?: AbortSignal): Promise<ExtractionResult> {
+  return parseExtraction(await requestLlm(config, extractionPrompt(chapter), signal));
+}
+
+async function callBatchLlm(config: LlmConfig, chapters: Chapter[], signal?: AbortSignal): Promise<Map<number, ExtractionResult>> {
+  return parseBatchExtraction(await requestLlm(config, batchExtractionPrompt(chapters), signal), chapters);
 }
 
 function splitChapterForAnalysis(chapter: Chapter): Chapter[] {
@@ -817,6 +955,92 @@ function mergeExtractions(results: ExtractionResult[]): ExtractionResult {
     characters: [...characters.values()],
     relationships: [...relationships.values()],
     statusEvents: [...statusEvents.values()]
+  };
+}
+
+function createAnalysisTasks(chapters: Chapter[]): AnalysisTask[] {
+  const tasks: AnalysisTask[] = [];
+  let current: Chapter[] = [];
+  let currentChars = 0;
+
+  const flush = (): void => {
+    if (!current.length) return;
+    const first = current[0];
+    const last = current[current.length - 1];
+    tasks.push({
+      id: first.id + '-' + last.id,
+      chapters: current,
+      label: current.length === 1
+        ? first.title
+        : first.title + ' 至 ' + last.title + '（' + current.length + '章）'
+    });
+    current = [];
+    currentChars = 0;
+  };
+
+  for (const chapter of chapters) {
+    if (chapter.content.length > analysisBatchCharBudget) {
+      flush();
+      tasks.push({ id: String(chapter.id), chapters: [chapter], label: chapter.title });
+      continue;
+    }
+    if (current.length >= analysisBatchMaxChapters || (current.length > 0 && currentChars + chapter.content.length > analysisBatchCharBudget)) {
+      flush();
+    }
+    current.push(chapter);
+    currentChars += chapter.content.length;
+  }
+  flush();
+  return tasks;
+}
+
+async function callBatchWithRetry(config: LlmConfig, chapters: Chapter[], signal?: AbortSignal): Promise<Map<number, ExtractionResult>> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt <= analysisMaxRetries; attempt += 1) {
+    try {
+      return await callBatchLlm(config, chapters, signal);
+    } catch (error) {
+      lastError = error;
+      if (signal?.aborted) throw error;
+      if (attempt < analysisMaxRetries) await abortableDelay(1200 * (attempt + 1), signal);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function callChaptersWithFallback(config: LlmConfig, chapters: Chapter[], signal?: AbortSignal): Promise<AnalysisBatchOutcome> {
+  if (!chapters.length) return { results: new Map(), failures: new Map() };
+
+  if (!(chapters.length === 1 && chapters[0].content.length > analysisBatchCharBudget)) {
+    try {
+      return { results: await callBatchWithRetry(config, chapters, signal), failures: new Map() };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+    }
+  }
+
+  if (chapters.length === 1) {
+    const chapter = chapters[0];
+    try {
+      return {
+        results: new Map([[chapter.id, await callChapterWithRetry(config, chapter, signal)]]),
+        failures: new Map()
+      };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return {
+        results: new Map(),
+        failures: new Map([[chapter.id, error instanceof Error ? error.message : String(error)]])
+      };
+    }
+  }
+
+  const midpoint = Math.ceil(chapters.length / 2);
+  const left = await callChaptersWithFallback(config, chapters.slice(0, midpoint), signal);
+  const right = await callChaptersWithFallback(config, chapters.slice(midpoint), signal);
+  return {
+    results: new Map([...left.results, ...right.results]),
+    failures: new Map([...left.failures, ...right.failures])
   };
 }
 
@@ -896,36 +1120,49 @@ function isAnalysisCancelled(runtime: AnalysisRuntime): boolean {
   return runtime.state.status === 'cancelled';
 }
 async function runAnalysisWorker(projectPath: string, runtime: AnalysisRuntime): Promise<void> {
-  while (runtime.nextIndex < runtime.chapters.length) {
+  while (runtime.nextIndex < runtime.tasks.length) {
     while (runtime.state.status === 'paused') {
       await abortableDelay(200);
       if (isAnalysisCancelled(runtime)) return;
     }
     if (runtime.state.status !== 'running') return;
 
-    const chapter = runtime.chapters[runtime.nextIndex];
+    const task = runtime.tasks[runtime.nextIndex];
     runtime.nextIndex += 1;
-    runtime.activeTitles.add(chapter.title);
+    runtime.activeTitles.add(task.label);
     const controller = new AbortController();
     runtime.abortControllers.add(controller);
     runtime.state.updatedAt = new Date().toISOString();
     await persistAnalysisProgress(projectPath, runtime);
 
     try {
-      const extraction = await callChapterWithRetry(runtime.config, chapter, controller.signal);
+      const outcome = await callChaptersWithFallback(runtime.config, task.chapters, controller.signal);
       if (!isAnalysisCancelled(runtime)) {
-        await persistAnalysisCandidate(projectPath, chapter.id, extraction);
-        runtime.state.completed += 1;
+        for (const chapter of task.chapters) {
+          const extraction = outcome.results.get(chapter.id);
+          const failure = outcome.failures.get(chapter.id);
+          if (extraction) {
+            await persistAnalysisCandidate(projectPath, chapter.id, extraction);
+            runtime.state.completed += 1;
+          } else {
+            const message = failure || '模型没有返回该章节结果。';
+            runtime.state.failed += 1;
+            runtime.state.errors = [...runtime.state.errors, chapter.title + ': ' + message].slice(-20);
+            await persistAnalysisError(projectPath, chapter.id, message);
+          }
+        }
       }
     } catch (error) {
       if (!isAnalysisCancelled(runtime) && !controller.signal.aborted) {
         const message = error instanceof Error ? error.message : String(error);
-        runtime.state.failed += 1;
-        runtime.state.errors = [...runtime.state.errors, chapter.title + ': ' + message].slice(-20);
-        await persistAnalysisError(projectPath, chapter.id, message);
+        for (const chapter of task.chapters) {
+          runtime.state.failed += 1;
+          runtime.state.errors = [...runtime.state.errors, chapter.title + ': ' + message].slice(-20);
+          await persistAnalysisError(projectPath, chapter.id, message);
+        }
       }
     } finally {
-      runtime.activeTitles.delete(chapter.title);
+      runtime.activeTitles.delete(task.label);
       runtime.abortControllers.delete(controller);
       runtime.state.updatedAt = new Date().toISOString();
       await persistAnalysisProgress(projectPath, runtime);
@@ -935,7 +1172,7 @@ async function runAnalysisWorker(projectPath: string, runtime: AnalysisRuntime):
 
 async function runAnalysisJob(projectPath: string, runtime: AnalysisRuntime): Promise<void> {
   try {
-    const workerCount = Math.min(analysisConcurrency, runtime.chapters.length);
+    const workerCount = Math.min(analysisConcurrency, runtime.tasks.length);
     await Promise.all(Array.from({ length: workerCount }, () => runAnalysisWorker(projectPath, runtime)));
     if (runtime.state.status === 'running') {
       runtime.state.status = runtime.state.failed === runtime.state.total && runtime.state.total > 0
@@ -958,10 +1195,7 @@ async function runAnalysisJob(projectPath: string, runtime: AnalysisRuntime): Pr
   }
 }
 
-async function startAnalysisJob(
-  projectPath: string,
-  upToChapterId?: number | null
-): Promise<AnalysisProgress> {
+async function startAnalysisJob(projectPath: string, upToChapterId?: number | null): Promise<AnalysisProgress> {
   const active = analysisJobs.get(projectPath);
   if (active && (active.state.status === 'running' || active.state.status === 'paused')) {
     return analysisSnapshot(active);
@@ -973,9 +1207,7 @@ async function startAnalysisJob(
   }
 
   const db = await openDb(projectPath);
-  const limitOrder = upToChapterId
-    ? scalar<number>(db, 'SELECT order_index FROM chapters WHERE id = ?', [upToChapterId])
-    : null;
+  const limitOrder = upToChapterId ? scalar<number>(db, 'SELECT order_index FROM chapters WHERE id = ?', [upToChapterId]) : null;
   if (upToChapterId && limitOrder === null) {
     await saveDb(projectPath, db);
     throw new Error('章节不存在。');
@@ -995,6 +1227,7 @@ async function startAnalysisJob(
   );
   await saveDb(projectPath, db);
 
+  const tasks = createAnalysisTasks(chapters);
   const now = new Date().toISOString();
   const runtime: AnalysisRuntime = {
     state: {
@@ -1013,7 +1246,7 @@ async function startAnalysisJob(
       estimatedRemainingMs: null,
       concurrency: analysisConcurrency
     },
-    chapters,
+    tasks,
     config,
     nextIndex: 0,
     activeTitles: new Set(),

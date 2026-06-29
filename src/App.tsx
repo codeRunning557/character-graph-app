@@ -437,7 +437,7 @@ export function App(): ReactElement {
       analysisSyncedAt.current = '';
       setStatus(
         progress.total
-          ? '分析任务已启动：3 路并发，失败章节自动重试，结果将进入候选区。'
+          ? '分析任务已启动：最多 50 章/批，批次失败会自动拆分重试，结果将进入候选区。'
           : '所选范围内没有需要重新分析的章节。'
       );
     } catch (error) {
