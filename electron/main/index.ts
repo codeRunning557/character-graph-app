@@ -263,10 +263,14 @@ function idleAnalysisProgress(): AnalysisProgress {
     status: 'idle',
     targetChapterId: null,
     targetOrderIndex: null,
+    scopeTotal: 0,
     total: 0,
     completed: 0,
     failed: 0,
+    skipped: 0,
     remaining: 0,
+    batchCount: 0,
+    batchMaxChapters: analysisBatchMaxChapters,
     activeChapterTitles: [],
     errors: [],
     startedAt: null,
@@ -1212,6 +1216,7 @@ async function startAnalysisJob(projectPath: string, upToChapterId?: number | nu
     await saveDb(projectPath, db);
     throw new Error('章节不存在。');
   }
+  const scopeTotal = scalar<number>(db, 'SELECT COUNT(*) FROM chapters WHERE (? IS NULL OR order_index <= ?)', [limitOrder, limitOrder]) ?? 0;
   const chapters = query<Chapter>(
     db,
     "SELECT c.* FROM chapters c WHERE (? IS NULL OR c.order_index <= ?) AND NOT EXISTS (SELECT 1 FROM candidate_extractions ce WHERE ce.chapter_id = c.id AND ce.kind = 'batch' AND ce.status IN ('pending', 'confirmed')) ORDER BY c.order_index ASC, c.id ASC",
@@ -1225,6 +1230,7 @@ async function startAnalysisJob(projectPath: string, upToChapterId?: number | nu
       contentLength: String(row.content).length
     })
   );
+  const skipped = Math.max(0, scopeTotal - chapters.length);
   await saveDb(projectPath, db);
 
   const tasks = createAnalysisTasks(chapters);
@@ -1234,10 +1240,14 @@ async function startAnalysisJob(projectPath: string, upToChapterId?: number | nu
       status: chapters.length ? 'running' : 'completed',
       targetChapterId: upToChapterId ?? null,
       targetOrderIndex: limitOrder,
+      scopeTotal,
       total: chapters.length,
       completed: 0,
       failed: 0,
+      skipped,
       remaining: chapters.length,
+      batchCount: tasks.length,
+      batchMaxChapters: analysisBatchMaxChapters,
       activeChapterTitles: [],
       errors: [],
       startedAt: now,
@@ -1293,16 +1303,18 @@ async function cancelAnalysisJob(projectPath: string): Promise<AnalysisProgress>
   return analysisSnapshot(runtime);
 }
 function findCharacterId(db: Database, name: string, aliases: string[]): number | null {
-  const byName = scalar<number>(db, 'SELECT id FROM characters WHERE name = ? LIMIT 1', [name]);
-  if (byName) return byName;
-  const rows = query<{ id: number; aliases: string[] }>(
-    db,
-    'SELECT id, aliases_json FROM characters',
-    [],
-    (row) => ({ id: Number(row.id), aliases: safeJson<string[]>(String(row.aliases_json), []) })
-  );
   const names = new Set([name, ...aliases].map((item) => item.trim()).filter(Boolean));
-  return rows.find((row) => row.aliases.some((alias) => names.has(alias)))?.id ?? null;
+  const rows = query<{ id: number; name: string; aliases: string[] }>(
+    db,
+    'SELECT id, name, aliases_json FROM characters',
+    [],
+    (row) => ({
+      id: Number(row.id),
+      name: String(row.name),
+      aliases: safeJson<string[]>(String(row.aliases_json), [])
+    })
+  );
+  return rows.find((row) => names.has(row.name) || row.aliases.some((alias) => names.has(alias)))?.id ?? null;
 }
 
 function upsertCharacter(
@@ -1316,22 +1328,26 @@ function upsertCharacter(
   const tags = [...new Set((input.tags ?? []).map((item) => item.trim()).filter(Boolean))];
   const existingId = findCharacterId(db, name, aliases);
   if (existingId) {
-    const existing = query<{ aliases: string[]; tags: string[]; summary: string }>(
+    const existing = query<{ name: string; aliases: string[]; tags: string[]; summary: string }>(
       db,
-      'SELECT aliases_json, tags_json, summary FROM characters WHERE id = ?',
+      'SELECT name, aliases_json, tags_json, summary FROM characters WHERE id = ?',
       [existingId],
       (row) => ({
+        name: String(row.name),
         aliases: safeJson<string[]>(String(row.aliases_json), []),
         tags: safeJson<string[]>(String(row.tags_json), []),
         summary: String(row.summary ?? '')
       })
     )[0];
+    const mergedAliases = new Set([...existing.aliases, ...aliases]);
+    if (existing.name !== name) mergedAliases.add(name);
+    mergedAliases.delete(existing.name);
     db.run(
       `UPDATE characters
        SET aliases_json = ?, tags_json = ?, summary = CASE WHEN summary = '' THEN ? ELSE summary END
        WHERE id = ?`,
       [
-        JSON.stringify([...new Set([...existing.aliases, ...aliases])]),
+        JSON.stringify([...mergedAliases]),
         JSON.stringify([...new Set([...existing.tags, ...tags])]),
         input.summary ?? '',
         existingId
@@ -1466,6 +1482,30 @@ function applyExtraction(db: Database, chapterId: number | null, result: Extract
       );
     });
   }
+}
+function clearConfirmedGraph(db: Database): void {
+  db.run('DELETE FROM bond_events');
+  db.run('DELETE FROM relationships');
+  db.run('DELETE FROM character_status_events');
+  db.run('DELETE FROM characters');
+}
+
+function rebuildConfirmedGraph(db: Database): void {
+  const candidates = query<{ chapterId: number | null; payload: ExtractionResult }>(
+    db,
+    `SELECT ce.chapter_id, ce.payload_json
+     FROM candidate_extractions ce
+     LEFT JOIN chapters c ON c.id = ce.chapter_id
+     WHERE ce.kind = 'batch' AND ce.status = 'confirmed'
+     ORDER BY COALESCE(c.order_index, 2147483647), ce.id ASC`,
+    [],
+    (row) => ({
+      chapterId: row.chapter_id === null ? null : Number(row.chapter_id),
+      payload: safeJson<ExtractionResult>(String(row.payload_json), { characters: [], relationships: [], statusEvents: [] })
+    })
+  );
+  clearConfirmedGraph(db);
+  for (const candidate of candidates) applyExtraction(db, candidate.chapterId, candidate.payload);
 }
 
 ipcMain.handle('project:create', async (_event, name: string) => {
@@ -1632,10 +1672,8 @@ ipcMain.handle('candidate:confirm', async (_event, projectPath: string, candidat
     await saveDb(projectPath, db);
     throw new Error('候选记录不存在。');
   }
-  if (candidate.kind === 'batch') {
-    applyExtraction(db, candidate.chapterId, candidate.payload as ExtractionResult);
-  }
   db.run("UPDATE candidate_extractions SET status = 'confirmed' WHERE id = ?", [candidateId]);
+  rebuildConfirmedGraph(db);
   await saveDb(projectPath, db);
   return graphData(projectPath);
 });
@@ -1660,15 +1698,16 @@ ipcMain.handle('candidate:confirm-pending', async (
     })
   );
   for (const candidate of candidates) {
-    applyExtraction(db, candidate.chapterId, candidate.payload);
     db.run("UPDATE candidate_extractions SET status = 'confirmed' WHERE id = ?", [candidate.id]);
   }
+  rebuildConfirmedGraph(db);
   await saveDb(projectPath, db);
   return graphData(projectPath);
 });
 ipcMain.handle('candidate:reject', async (_event, projectPath: string, candidateId: number) => {
   const db = await openDb(projectPath);
   db.run("UPDATE candidate_extractions SET status = 'rejected' WHERE id = ?", [candidateId]);
+  rebuildConfirmedGraph(db);
   await saveDb(projectPath, db);
   return graphData(projectPath);
 });

@@ -178,7 +178,11 @@ try {
       upToChapterId: imported.chapters[103].id
     })
   });
+  assert(progress.scopeTotal === 104, 'Expected the selected scope to contain 104 chapters.');
   assert(progress.total === 104, 'Expected the full chapter range to be queued.');
+  assert(progress.skipped === 0, 'First run should not skip cached chapters.');
+  assert(progress.batchCount === 3, 'Expected 104 chapters to be split into 3 initial batches.');
+  assert(progress.batchMaxChapters === 50, 'Expected max 50 chapters per batch.');
   assert(progress.concurrency === 2, 'Expected batch analysis concurrency to be 2.');
 
   progress = await request(baseUrl, '/api/analysis/pause', {
@@ -223,13 +227,28 @@ try {
   assert(confirmed.characters.length >= 105, 'Bulk confirmation did not create characters.');
   assert(confirmed.relationships.length >= 104, 'Bulk confirmation did not create relationships.');
 
+  const callsAfterConfirm = modelCalls;
+  const cached = await request(baseUrl, '/api/analysis/start', {
+    method: 'POST',
+    body: JSON.stringify({
+      projectPath: project.path,
+      upToChapterId: imported.chapters[103].id
+    })
+  });
+  assert(cached.status === 'completed', 'Cached rerun should complete immediately.');
+  assert(cached.scopeTotal === 104, 'Cached rerun should keep the selected scope.');
+  assert(cached.total === 0, 'Cached rerun should not queue model work.');
+  assert(cached.skipped === 104, 'Cached rerun should skip all previously analyzed chapters.');
+  assert(modelCalls === callsAfterConfirm, 'Cached rerun should not call the model again.');
+
   console.log(JSON.stringify({
     chapters: progress.completed,
     modelCalls,
     maxConcurrency: maxActiveRequests,
     pendingBeforeConfirm: pending,
     charactersAfterConfirm: confirmed.characters.length,
-    relationshipsAfterConfirm: confirmed.relationships.length
+    relationshipsAfterConfirm: confirmed.relationships.length,
+    cachedSkipped: cached.skipped
   }));
 } finally {
   if (webServer) await close(webServer);

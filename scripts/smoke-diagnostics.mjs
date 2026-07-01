@@ -234,7 +234,10 @@ try {
     method: 'POST',
     body: JSON.stringify({ projectPath: project.path, upToChapterId: imported.chapters[2].id })
   });
+  assert(progress.scopeTotal === 3, 'Selecting chapter 3 should scope chapters 1-3 only.');
   assert(progress.total === 3, 'Selecting chapter 3 should queue chapters 1-3 only.');
+  assert(progress.skipped === 0, 'First diagnostics run should not skip cached chapters.');
+  assert(progress.batchCount === 1, 'Chapters 1-3 should fit in one batch.');
 
   const started = Date.now();
   while (progress.status === 'running' || progress.status === 'paused') {

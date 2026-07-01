@@ -6,6 +6,8 @@ import {
   CheckCheck,
   ChevronDown,
   CircleAlert,
+  Eye,
+  EyeOff,
   FileInput,
   FolderOpen,
   GitBranch,
@@ -119,6 +121,8 @@ export function App(): ReactElement {
   const [project, setProject] = useState<ProjectSummary | null>(null);
   const [graph, setGraph] = useState<GraphData>(emptyGraph);
   const [chapterLimitId, setChapterLimitId] = useState<number | null>(null);
+  const [showInactiveCharacters, setShowInactiveCharacters] = useState(false);
+  const [focusMainComponent, setFocusMainComponent] = useState(true);
   const [selection, setSelection] = useState<Selection>(null);
   const [status, setStatus] = useState('未打开项目');
   const [busy, setBusy] = useState(false);
@@ -168,6 +172,7 @@ export function App(): ReactElement {
             (progress.completed + progress.failed) + '/' + progress.total + ' 章，' +
             '耗时 ' + formatDuration(progress.elapsedMs) +
             (progress.estimatedRemainingMs ? '，预计剩余 ' + formatDuration(progress.estimatedRemainingMs) : '') +
+            (progress.skipped ? '，缓存跳过 ' + progress.skipped + ' 章' : '') +
             active
           );
         }
@@ -187,6 +192,7 @@ export function App(): ReactElement {
           setStatus(
             resultText + '：成功 ' + progress.completed + ' 章，失败 ' + progress.failed + ' 章，' +
             '耗时 ' + formatDuration(progress.elapsedMs) + '。' +
+            (progress.skipped ? '缓存跳过 ' + progress.skipped + ' 章。' : '') +
             (data.candidates.some((candidate) => candidate.status === 'pending')
               ? '请确认候选后生成正式图谱。'
               : '')
@@ -285,12 +291,12 @@ export function App(): ReactElement {
     [chapterLimitId, graph.chapters]
   );
   const scopedGraph = useMemo(
-    () => buildChapterScopedGraph(graph, chapterLimit),
-    [chapterLimit, graph]
+    () => buildChapterScopedGraph(graph, chapterLimit, { showInactive: showInactiveCharacters, focusMainComponent }),
+    [chapterLimit, focusMainComponent, graph, showInactiveCharacters]
   );
   const diagnostics = useMemo(
-    () => buildGraphDiagnostics(graph, scopedGraph, chapterLimit),
-    [chapterLimit, graph, scopedGraph]
+    () => buildGraphDiagnostics(graph, scopedGraph, chapterLimit, showInactiveCharacters),
+    [chapterLimit, graph, scopedGraph, showInactiveCharacters]
   );
   useEffect(() => {
     const cy = cyRef.current;
@@ -437,7 +443,7 @@ export function App(): ReactElement {
       analysisSyncedAt.current = '';
       setStatus(
         progress.total
-          ? '分析任务已启动：最多 50 章/批，批次失败会自动拆分重试，结果将进入候选区。'
+          ? '分析任务已启动：最多 ' + progress.batchMaxChapters + ' 章/批，共 ' + progress.batchCount + ' 批；缓存跳过 ' + progress.skipped + ' 章，结果将进入候选区。'
           : '所选范围内没有需要重新分析的章节。'
       );
     } catch (error) {
@@ -592,8 +598,8 @@ export function App(): ReactElement {
               <span style={{ width: analysisPercent + '%' }} />
             </div>
             <div className="analysis-metrics">
-              <span>{analysis.completed + analysis.failed}/{analysis.total} 章</span>
-              <span>{analysis.failed ? analysis.failed + ' 章失败' : analysis.concurrency + ' 路并发'}</span>
+              <span>{analysis.completed + analysis.failed}/{analysis.total} 待跑</span>
+              <span>{analysis.failed ? analysis.failed + ' 章失败' : analysis.skipped ? '缓存 ' + analysis.skipped + ' 章' : analysis.batchCount + ' 批'}</span>
             </div>
             {analysis.activeChapterTitles.length > 0 && (
               <p title={analysis.activeChapterTitles.join('、')}>
@@ -690,6 +696,22 @@ export function App(): ReactElement {
             </span>
           </div>
           <div className="top-actions">
+            <button
+              disabled={!project || !graph.relationships.length}
+              className={focusMainComponent ? 'toggle-on' : ''}
+              onClick={() => setFocusMainComponent((value) => !value)}
+            >
+              <GitBranch size={16} />
+              主角关联
+            </button>
+            <button
+              disabled={!project || !graph.statusEvents.length}
+              className={showInactiveCharacters ? 'toggle-on' : ''}
+              onClick={() => setShowInactiveCharacters((value) => !value)}
+            >
+              {showInactiveCharacters ? <Eye size={16} /> : <EyeOff size={16} />}
+              退场人物
+            </button>
             <button disabled={!project || !graph.chapters.length} onClick={() => setShowDiagnostics(true)}>
               <ListChecks size={16} />
               诊断
@@ -1160,7 +1182,7 @@ function splitTags(value: string): string[] {
     .filter(Boolean);
 }
 
-function buildGraphDiagnostics(graph: GraphData, scopedGraph: GraphData, limit: Chapter | null): GraphDiagnostics {
+function buildGraphDiagnostics(graph: GraphData, scopedGraph: GraphData, limit: Chapter | null, showInactive: boolean): GraphDiagnostics {
   const limitOrderIndex = limit?.orderIndex ?? Number.POSITIVE_INFINITY;
   const scopeChapters = graph.chapters.filter((chapter) => chapter.orderIndex <= limitOrderIndex);
   const scopeChapterIds = new Set(scopeChapters.map((chapter) => chapter.id));
@@ -1176,15 +1198,17 @@ function buildGraphDiagnostics(graph: GraphData, scopedGraph: GraphData, limit: 
   const relationshipsById = new Map(graph.relationships.map((relationship) => [relationship.id, relationship]));
   const visibleRelationshipIds = new Set(scopedGraph.relationships.map((relationship) => relationship.id));
   const hiddenByChapter = new Map<number, string[]>();
-  const hiddenCharacterNames = uniqueStrings(
-    graph.statusEvents
-      .filter((event) => isInactiveStatus(event.status))
-      .filter((event) => event.chapterId === null || scopeChapterIds.has(event.chapterId))
-      .map((event) => event.characterName)
-  );
+  const hiddenCharacterNames = showInactive
+    ? []
+    : uniqueStrings(
+      graph.statusEvents
+        .filter((event) => isInactiveStatus(event.status))
+        .filter((event) => event.chapterId === null || scopeChapterIds.has(event.chapterId))
+        .map((event) => event.characterName)
+    );
 
   graph.statusEvents.forEach((event) => {
-    if (!isInactiveStatus(event.status) || event.chapterId === null || !scopeChapterIds.has(event.chapterId)) return;
+    if (showInactive || !isInactiveStatus(event.status) || event.chapterId === null || !scopeChapterIds.has(event.chapterId)) return;
     const current = hiddenByChapter.get(event.chapterId) ?? [];
     current.push(event.characterName + '（' + inactiveStatusText(event.status) + '）');
     hiddenByChapter.set(event.chapterId, uniqueStrings(current));
@@ -1271,7 +1295,7 @@ function buildGraphDiagnostics(graph: GraphData, scopedGraph: GraphData, limit: 
   if (totals.confirmedCandidates > 0 && scopedGraph.relationships.length === 0) {
     warnings.push('候选已经确认，但当前图上没有关系线，重点检查状态过滤、章节范围和事件写入。');
   }
-  if (hiddenCharacterNames.length > 0) {
+  if (!showInactive && hiddenCharacterNames.length > 0) {
     warnings.push('当前范围隐藏了 ' + hiddenCharacterNames.length + ' 个死亡、退场或不再使用的人物。');
   }
 
@@ -1372,7 +1396,12 @@ function inactiveStatusText(status: string): string {
   return status;
 }
 
-function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): GraphData {
+interface ScopedGraphOptions {
+  showInactive: boolean;
+  focusMainComponent: boolean;
+}
+
+function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null, options: ScopedGraphOptions): GraphData {
   const chapterOrder = new Map(graph.chapters.map((chapter) => [chapter.id, chapter.orderIndex]));
   const limitOrderIndex = limit?.orderIndex ?? Number.POSITIVE_INFINITY;
   const allowedChapterIds = new Set(
@@ -1380,16 +1409,18 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
       .filter((chapter) => chapter.orderIndex <= limitOrderIndex)
       .map((chapter) => chapter.id)
   );
-  const inactiveCharacterIds = new Set(
-    graph.statusEvents
-      .filter((event) => event.status === 'dead' || event.status === 'retired' || event.status === 'unused')
-      .filter((event) => {
-        if (event.chapterId === null) return true;
-        const orderIndex = chapterOrder.get(event.chapterId);
-        return orderIndex !== undefined && orderIndex <= limitOrderIndex;
-      })
-      .map((event) => event.characterId)
-  );
+  const inactiveCharacterIds = options.showInactive
+    ? new Set<number>()
+    : new Set(
+      graph.statusEvents
+        .filter((event) => event.status === 'dead' || event.status === 'retired' || event.status === 'unused')
+        .filter((event) => {
+          if (event.chapterId === null) return true;
+          const orderIndex = chapterOrder.get(event.chapterId);
+          return orderIndex !== undefined && orderIndex <= limitOrderIndex;
+        })
+        .map((event) => event.characterId)
+    );
   const events = graph.events.filter((event) => {
     if (event.chapterId === null) return true;
     const orderIndex = chapterOrder.get(event.chapterId);
@@ -1402,7 +1433,7 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
     current.push(event);
     eventsByRelationship.set(event.relationshipId, current);
   });
-  const relationships = graph.relationships
+  let relationships = graph.relationships
     .filter((relationship) =>
       relationshipIds.has(relationship.id) &&
       !inactiveCharacterIds.has(relationship.sourceCharacterId) &&
@@ -1415,6 +1446,20 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
         .join('\n');
       return scopedSummary ? { ...relationship, summary: scopedSummary } : relationship;
     });
+
+  const characterIsInScope = (character: CharacterNode): boolean =>
+    !inactiveCharacterIds.has(character.id) &&
+    (character.firstChapterId === null || allowedChapterIds.has(character.firstChapterId));
+
+  const focusCharacterIds = options.focusMainComponent && relationships.length > 0
+    ? inferMainComponent(graph.characters.filter(characterIsInScope), relationships, chapterOrder)
+    : null;
+  if (focusCharacterIds) {
+    relationships = relationships.filter((relationship) =>
+      focusCharacterIds.has(relationship.sourceCharacterId) && focusCharacterIds.has(relationship.targetCharacterId)
+    );
+  }
+
   const visibleRelationshipIds = new Set(relationships.map((relationship) => relationship.id));
   const visibleEvents = events.filter((event) => visibleRelationshipIds.has(event.relationshipId));
   const characterIds = new Set<number>();
@@ -1423,13 +1468,11 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
     characterIds.add(relationship.sourceCharacterId);
     characterIds.add(relationship.targetCharacterId);
   });
+
+  const includeAllScopedCharacters = !options.focusMainComponent || !focusCharacterIds || relationships.length === 0;
   graph.characters.forEach((character) => {
-    if (
-      !inactiveCharacterIds.has(character.id) &&
-      (character.firstChapterId === null || allowedChapterIds.has(character.firstChapterId))
-    ) {
-      characterIds.add(character.id);
-    }
+    if (!characterIsInScope(character)) return;
+    if (includeAllScopedCharacters || focusCharacterIds?.has(character.id)) characterIds.add(character.id);
   });
 
   return {
@@ -1440,6 +1483,52 @@ function buildChapterScopedGraph(graph: GraphData, limit: Chapter | null): Graph
     statusEvents: graph.statusEvents,
     candidates: graph.candidates
   };
+}
+
+function inferMainComponent(
+  characters: CharacterNode[],
+  relationships: RelationshipEdge[],
+  chapterOrder: Map<number, number>
+): Set<number> | null {
+  const scopedIds = new Set(characters.map((character) => character.id));
+  const adjacency = new Map<number, Set<number>>();
+  const weightedDegree = new Map<number, number>();
+  characters.forEach((character) => {
+    adjacency.set(character.id, new Set());
+    weightedDegree.set(character.id, 0);
+  });
+  relationships.forEach((relationship) => {
+    if (!scopedIds.has(relationship.sourceCharacterId) || !scopedIds.has(relationship.targetCharacterId)) return;
+    adjacency.get(relationship.sourceCharacterId)?.add(relationship.targetCharacterId);
+    adjacency.get(relationship.targetCharacterId)?.add(relationship.sourceCharacterId);
+    weightedDegree.set(relationship.sourceCharacterId, (weightedDegree.get(relationship.sourceCharacterId) ?? 0) + relationship.strength);
+    weightedDegree.set(relationship.targetCharacterId, (weightedDegree.get(relationship.targetCharacterId) ?? 0) + relationship.strength);
+  });
+  const candidates = characters
+    .filter((character) => (adjacency.get(character.id)?.size ?? 0) > 0)
+    .sort((a, b) => {
+      const degreeDiff = (adjacency.get(b.id)?.size ?? 0) - (adjacency.get(a.id)?.size ?? 0);
+      if (degreeDiff !== 0) return degreeDiff;
+      const weightDiff = (weightedDegree.get(b.id) ?? 0) - (weightedDegree.get(a.id) ?? 0);
+      if (weightDiff !== 0) return weightDiff;
+      const aOrder = a.firstChapterId === null ? Number.POSITIVE_INFINITY : chapterOrder.get(a.firstChapterId) ?? Number.POSITIVE_INFINITY;
+      const bOrder = b.firstChapterId === null ? Number.POSITIVE_INFINITY : chapterOrder.get(b.firstChapterId) ?? Number.POSITIVE_INFINITY;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      return a.name.localeCompare(b.name, 'zh-CN');
+    });
+  const root = candidates[0]?.id;
+  if (root === undefined) return null;
+  const component = new Set<number>([root]);
+  const queue = [root];
+  while (queue.length) {
+    const current = queue.shift() as number;
+    for (const next of adjacency.get(current) ?? []) {
+      if (component.has(next)) continue;
+      component.add(next);
+      queue.push(next);
+    }
+  }
+  return component;
 }
 
 function buildLinearPositions(

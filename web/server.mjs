@@ -107,10 +107,14 @@ function idleAnalysisProgress() {
     status: 'idle',
     targetChapterId: null,
     targetOrderIndex: null,
+    scopeTotal: 0,
     total: 0,
     completed: 0,
     failed: 0,
+    skipped: 0,
     remaining: 0,
+    batchCount: 0,
+    batchMaxChapters: analysisBatchMaxChapters,
     activeChapterTitles: [],
     errors: [],
     startedAt: null,
@@ -964,6 +968,7 @@ async function startAnalysisJob(projectPath, upToChapterId) {
     await saveDb(projectPath, db);
     throw new Error('章节不存在。');
   }
+  const scopeTotal = scalar(db, 'SELECT COUNT(*) FROM chapters WHERE (? IS NULL OR order_index <= ?)', [limitOrder, limitOrder]) ?? 0;
   const chapters = query(db,
     "SELECT c.* FROM chapters c WHERE (? IS NULL OR c.order_index <= ?) AND NOT EXISTS (SELECT 1 FROM candidate_extractions ce WHERE ce.chapter_id = c.id AND ce.kind = 'batch' AND ce.status IN ('pending', 'confirmed')) ORDER BY c.order_index ASC, c.id ASC",
     [limitOrder, limitOrder],
@@ -976,6 +981,7 @@ async function startAnalysisJob(projectPath, upToChapterId) {
       contentLength: String(row.content).length
     })
   );
+  const skipped = Math.max(0, scopeTotal - chapters.length);
   await saveDb(projectPath, db);
   const tasks = createAnalysisTasks(chapters);
   const now = new Date().toISOString();
@@ -984,10 +990,14 @@ async function startAnalysisJob(projectPath, upToChapterId) {
       status: chapters.length ? 'running' : 'completed',
       targetChapterId: upToChapterId ?? null,
       targetOrderIndex: limitOrder,
+      scopeTotal,
       total: chapters.length,
       completed: 0,
       failed: 0,
+      skipped,
       remaining: chapters.length,
+      batchCount: tasks.length,
+      batchMaxChapters: analysisBatchMaxChapters,
       activeChapterTitles: [],
       errors: [],
       startedAt: now,
@@ -1043,11 +1053,13 @@ async function cancelAnalysisJob(projectPath) {
   return analysisSnapshot(runtime);
 }
 function findCharacterId(db, name, aliases) {
-  const byName = scalar(db, 'SELECT id FROM characters WHERE name = ? LIMIT 1', [name]);
-  if (byName) return Number(byName);
-  const rows = query(db, 'SELECT id, aliases_json FROM characters', [], (row) => ({ id: Number(row.id), aliases: safeJson(String(row.aliases_json), []) }));
-  const names = new Set([name, ...aliases].map((item) => item.trim()).filter(Boolean));
-  return rows.find((row) => row.aliases.some((alias) => names.has(alias)))?.id ?? null;
+  const names = new Set([name, ...aliases].map((item) => String(item).trim()).filter(Boolean));
+  const rows = query(db, 'SELECT id, name, aliases_json FROM characters', [], (row) => ({
+    id: Number(row.id),
+    name: String(row.name),
+    aliases: safeJson(String(row.aliases_json), [])
+  }));
+  return rows.find((row) => names.has(row.name) || row.aliases.some((alias) => names.has(alias)))?.id ?? null;
 }
 
 function upsertCharacter(db, input, chapterId) {
@@ -1057,15 +1069,19 @@ function upsertCharacter(db, input, chapterId) {
   const tags = [...new Set((input.tags ?? []).map((item) => String(item).trim()).filter(Boolean))];
   const existingId = findCharacterId(db, name, aliases);
   if (existingId) {
-    const existing = query(db, 'SELECT aliases_json, tags_json, summary FROM characters WHERE id = ?', [existingId], (row) => ({
+    const existing = query(db, 'SELECT name, aliases_json, tags_json, summary FROM characters WHERE id = ?', [existingId], (row) => ({
+      name: String(row.name),
       aliases: safeJson(String(row.aliases_json), []),
       tags: safeJson(String(row.tags_json), []),
       summary: String(row.summary ?? '')
     }))[0];
+    const mergedAliases = new Set([...existing.aliases, ...aliases]);
+    if (existing.name !== name) mergedAliases.add(name);
+    mergedAliases.delete(existing.name);
     db.run(`UPDATE characters
       SET aliases_json = ?, tags_json = ?, summary = CASE WHEN summary = '' THEN ? ELSE summary END
       WHERE id = ?`, [
-      JSON.stringify([...new Set([...existing.aliases, ...aliases])]),
+      JSON.stringify([...mergedAliases]),
       JSON.stringify([...new Set([...existing.tags, ...tags])]),
       input.summary ?? '',
       existingId
@@ -1153,6 +1169,30 @@ function applyExtraction(db, chapterId, result) {
         VALUES (?, ?, ?, ?, ?, 'confirmed')`, [relationshipId, chapterId, event.summary || '', event.evidence || '', index]);
     });
   }
+}
+function clearConfirmedGraph(db) {
+  db.run('DELETE FROM bond_events');
+  db.run('DELETE FROM relationships');
+  db.run('DELETE FROM character_status_events');
+  db.run('DELETE FROM characters');
+}
+
+function rebuildConfirmedGraph(db) {
+  const candidates = query(
+    db,
+    `SELECT ce.chapter_id, ce.payload_json
+     FROM candidate_extractions ce
+     LEFT JOIN chapters c ON c.id = ce.chapter_id
+     WHERE ce.kind = 'batch' AND ce.status = 'confirmed'
+     ORDER BY COALESCE(c.order_index, 2147483647), ce.id ASC`,
+    [],
+    (row) => ({
+      chapterId: row.chapter_id === null ? null : Number(row.chapter_id),
+      payload: safeJson(String(row.payload_json), { characters: [], relationships: [], statusEvents: [] })
+    })
+  );
+  clearConfirmedGraph(db);
+  for (const candidate of candidates) applyExtraction(db, candidate.chapterId, candidate.payload);
 }
 
 async function analyzeNovel(projectPath, upToChapterId) {
@@ -1248,8 +1288,8 @@ async function handleApi(req, res, url) {
       payload: safeJson(String(row.payload_json), { characters: [], relationships: [], statusEvents: [] })
     }))[0];
     if (candidate) {
-      applyExtraction(db, candidate.chapterId, candidate.payload);
       db.run("UPDATE candidate_extractions SET status = 'confirmed' WHERE id = ?", [body.candidateId]);
+      rebuildConfirmedGraph(db);
     }
     await saveDb(body.projectPath, db);
     return sendJson(res, await graphData(body.projectPath));
@@ -1271,15 +1311,16 @@ async function handleApi(req, res, url) {
       })
     );
     for (const candidate of candidates) {
-      applyExtraction(db, candidate.chapterId, candidate.payload);
       db.run("UPDATE candidate_extractions SET status = 'confirmed' WHERE id = ?", [candidate.id]);
     }
+    rebuildConfirmedGraph(db);
     await saveDb(body.projectPath, db);
     return sendJson(res, await graphData(body.projectPath));
   }  if (req.method === 'POST' && url.pathname === '/api/candidates/reject') {
     const body = await json();
     const db = await openDb(body.projectPath);
     db.run("UPDATE candidate_extractions SET status = 'rejected' WHERE id = ?", [body.candidateId]);
+    rebuildConfirmedGraph(db);
     await saveDb(body.projectPath, db);
     return sendJson(res, await graphData(body.projectPath));
   }

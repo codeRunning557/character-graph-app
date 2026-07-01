@@ -123,10 +123,14 @@ export interface AnalysisProgress {
   status: AnalysisStatus;
   targetChapterId: number | null;
   targetOrderIndex: number | null;
+  scopeTotal: number;
   total: number;
   completed: number;
   failed: number;
+  skipped: number;
   remaining: number;
+  batchCount: number;
+  batchMaxChapters: number;
   activeChapterTitles: string[];
   errors: string[];
   startedAt: string | null;

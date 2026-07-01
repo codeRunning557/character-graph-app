@@ -81,6 +81,12 @@ button.primary,
   border-color: #1f766e;
 }
 
+button.toggle-on {
+  border-color: #1f766e;
+  background: #e5f3ef;
+  color: #165c55;
+}
+
 input,
 select,
 textarea {
